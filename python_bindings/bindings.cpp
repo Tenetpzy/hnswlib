@@ -227,12 +227,12 @@ class Index {
     }
 
 
-    void loadIndex(const std::string &path_to_index, size_t max_elements, bool allow_replace_deleted) {
+    void loadIndex(const std::string &path_to_index, size_t max_elements, size_t cache_size, bool allow_replace_deleted) {
       if (appr_alg) {
           std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
           delete appr_alg;
       }
-      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, false, max_elements, allow_replace_deleted);
+      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, cache_size, false, max_elements, allow_replace_deleted);
       cur_l = appr_alg->cur_element_count;
       index_inited = true;
     }
@@ -720,6 +720,22 @@ class Index {
     size_t getCurrentCount() const {
         return appr_alg->cur_element_count;
     }
+
+    float get_cache_hit_rate() const {
+        return appr_alg->get_cache_hit_rate();
+    }
+
+    size_t get_io_op_num() const {
+        return appr_alg->get_io_op_num();
+    }
+
+    float get_memory_transfer_kb() const {
+        return appr_alg->get_memory_transfer_kb();
+    }
+
+    void reset_metrics_counter() {
+        appr_alg->reset_metrics_counter();
+    }
 };
 
 template<typename dist_t, typename data_t = float>
@@ -909,6 +925,7 @@ class BFIndex {
 
 PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
+        m.attr("__version__") = VERSION_INFO;
 
         py::class_<Index<float>>(m, "Index")
         .def(py::init(&Index<float>::createFromParams), py::arg("params"))
@@ -944,12 +961,17 @@ PYBIND11_PLUGIN(hnswlib) {
             &Index<float>::loadIndex,
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
+            py::arg("cache_size") = 0,
             py::arg("allow_replace_deleted") = false)
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
         .def("get_max_elements", &Index<float>::getMaxElements)
         .def("get_current_count", &Index<float>::getCurrentCount)
+        .def("get_cache_hit_rate", &Index<float>::get_cache_hit_rate)
+        .def("get_io_op_num", &Index<float>::get_io_op_num)
+        .def("get_memory_transfer_kb", &Index<float>::get_memory_transfer_kb)
+        .def("reset_metrics_counter", &Index<float>::reset_metrics_counter)
         .def_readonly("space", &Index<float>::space_name)
         .def_readonly("dim", &Index<float>::dim)
         .def_readwrite("num_threads", &Index<float>::num_threads_default)

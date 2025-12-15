@@ -11,3 +11,8 @@ var/
 .vs/
 **.DS_Store
 *.pyc
+CLAUDE.md
+.cache
+.doc
+compile_commands.json
+.clangd

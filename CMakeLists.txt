@@ -3,15 +3,32 @@ cmake_minimum_required(VERSION 3.0...3.26)
 project(hnswlib
     LANGUAGES CXX)
 
+# Generate compile_commands.json for IDE support
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 include(GNUInstallDirs)
 include(CheckCXXCompilerFlag)
 
-add_library(hnswlib INTERFACE)
+# Set C++ standard for the entire project
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Collect all source files for hnswlib
+file(GLOB HNSWLIB_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/hnswlib/*.cc
+)
+
+add_library(hnswlib ${HNSWLIB_SOURCES})
 add_library(hnswlib::hnswlib ALIAS hnswlib)
 
-target_include_directories(hnswlib INTERFACE
+target_include_directories(hnswlib
+    PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/hnswlib>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hnswlib>
+)
 
 # Install
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/hnswlib
@@ -32,25 +49,32 @@ else()
     option(HNSWLIB_EXAMPLES "Build examples and tests." OFF)
 endif()
 if(HNSWLIB_EXAMPLES)
-    set(CMAKE_CXX_STANDARD 11)
-
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      SET( CMAKE_CXX_FLAGS  "-Ofast -std=c++11 -DHAVE_CXX0X -openmp -fpic -ftree-vectorize" )
-      check_cxx_compiler_flag("-march=native" COMPILER_SUPPORT_NATIVE_FLAG)
-      if(COMPILER_SUPPORT_NATIVE_FLAG)
-        SET( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native" )
-        message("set -march=native flag")
-      else()
-        check_cxx_compiler_flag("-mcpu=apple-m1" COMPILER_SUPPORT_M1_FLAG)
-        if(COMPILER_SUPPORT_M1_FLAG)
-          SET( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-m1" )
-          message("set -mcpu=apple-m1 flag")
-        endif()
+    # Debug模式下禁用优化以支持调试
+    # Debug mode: disable optimization for debugging
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+      if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        SET( CMAKE_CXX_FLAGS  "-O0 -g -openmp -fpic -ftree-vectorize" )
+      elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        SET( CMAKE_CXX_FLAGS  "-O0 -g -lrt -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0" )
+      elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        SET( CMAKE_CXX_FLAGS  "/Od /Zi /openmp /EHsc" )
       endif()
-    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-      SET( CMAKE_CXX_FLAGS  "-Ofast -lrt -std=c++11 -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0" )
-    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-      SET( CMAKE_CXX_FLAGS  "/O2 -DHAVE_CXX0X /W1 /openmp /EHsc" )
+      message("Debug build: disabled optimizations for debugging")
+    else()
+      # Release模式保持原有优化设置
+      # Release mode: keep original optimization settings
+      if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        SET( CMAKE_CXX_FLAGS  "-Ofast -openmp -fpic -ftree-vectorize" )
+        check_cxx_compiler_flag("-march=native" COMPILER_SUPPORT_NATIVE_FLAG)
+        if(COMPILER_SUPPORT_NATIVE_FLAG)
+          SET( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native" )
+        endif()
+      elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        SET( CMAKE_CXX_FLAGS  "-Ofast -lrt -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0" )
+      elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        SET( CMAKE_CXX_FLAGS  "/O2 /W1 /openmp /EHsc" )
+      endif()
+      message("Release build: enabled optimizations (-Ofast)")
     endif()
 
     # examples
@@ -102,4 +126,7 @@ if(HNSWLIB_EXAMPLES)
 
     add_executable(main tests/cpp/main.cpp tests/cpp/sift_1b.cpp)
     target_link_libraries(main hnswlib)
+
+    add_executable(hnswcache_test tests/cpp/hnswcache_test.cpp)
+    target_link_libraries(hnswcache_test hnswlib)
 endif()

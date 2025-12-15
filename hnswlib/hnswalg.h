@@ -1,24 +1,97 @@
 #pragma once
 
+#include "hnswcache.h"
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
+#include <cstddef>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
 #include <unordered_set>
-#include <list>
 #include <memory>
+#include <utility>
 
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
+static const unsigned char DELETE_MARK = 0x01;
+template<typename dist_t>
+class HierarchicalNSW;
+
+class PointPageLevel0 {
+public:
+    template<typename dist_t>
+    PointPageLevel0(PageHandler&& ph, size_t base_offset, const HierarchicalNSW<dist_t> *hnsw)
+        : page_handler(std::move(ph)) {
+        neighbor_count_offset = base_offset + hnsw->offsetLevel0_;
+        neighbor_list_offset = neighbor_count_offset + 4;
+        data_offset = base_offset + hnsw->offsetData_;
+        label_offset = base_offset + hnsw->label_offset_;
+        del_flag_offset = base_offset + hnsw->offsetLevel0_ + 2;
+    }
+
+    tableint *get_neighbor_list() const {
+        return (tableint *)(page_handler.get_ptr() + neighbor_list_offset);
+    }
+
+    int get_neighbor_count() const {
+        int count = *((unsigned short int *)(page_handler.get_ptr() + neighbor_count_offset));
+        return count;
+    }
+
+    labeltype get_label() const {
+        labeltype label;
+        memcpy(&label, page_handler.get_ptr() + label_offset, sizeof(labeltype));
+        return label;
+    }
+
+    char *get_data() const {
+        return page_handler.get_ptr() + data_offset;
+    }
+
+    bool is_deleted() const {
+        unsigned char del_flag = *((unsigned char *)(page_handler.get_ptr() + del_flag_offset)) & DELETE_MARK;
+        return del_flag;
+    }
+
+private:
+    PageHandler page_handler;
+    int neighbor_count_offset;
+    int neighbor_list_offset;
+    int data_offset;
+    int label_offset;
+    int del_flag_offset;
+};
+
+class PointPageHigherLevel {
+public:
+    PointPageHigherLevel(PageHandler&& ph, size_t base_offset)
+        : page_handler(std::move(ph)) {
+        neighbor_count_offset = base_offset;
+        neighbor_list_offset = neighbor_count_offset + 4;
+    }
+
+    tableint *get_neighbor_list() const {
+        return (tableint *)(page_handler.get_ptr() + neighbor_list_offset);
+    }
+
+    int get_neighbor_count() const {
+        int count = *((int *)(page_handler.get_ptr() + neighbor_count_offset));
+        return count;
+    }
+
+private:
+    PageHandler page_handler;
+    int neighbor_count_offset;
+    int neighbor_list_offset;
+};
+
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
  public:
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
-    static const unsigned char DELETE_MARK = 0x01;
 
     size_t max_elements_{0};
     mutable std::atomic<size_t> cur_element_count{0};  // current number of elements
@@ -70,19 +143,22 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
-
-    HierarchicalNSW(SpaceInterface<dist_t> *s) {
-    }
-
+    // Page cache and on-demand loading support
+    std::unique_ptr<HnswPageCache> page_cache;
+    size_t page_size_{0};  // page size for on-demand loading
+    size_t level0_elements_per_page_{0};  // number of elements per page in level 0
+    page_id_t level0_first_page_id_{0};  // page id of the first element in level 0
+    page_id_t link_offset_array_page_id_{0};  // page id of the link offset array
 
     HierarchicalNSW(
         SpaceInterface<dist_t> *s,
         const std::string &location,
+        size_t cache_size = 0,
         bool nmslib = false,
         size_t max_elements = 0,
         bool allow_replace_deleted = false)
         : allow_replace_deleted_(allow_replace_deleted) {
-        loadIndex(location, s, max_elements);
+        loadIndex(location, s, max_elements, cache_size);
     }
 
 
@@ -149,14 +225,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
-        free(data_level0_memory_);
-        data_level0_memory_ = nullptr;
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
+        if (data_level0_memory_ != nullptr) {
+            free(data_level0_memory_);
+            data_level0_memory_ = nullptr;
         }
-        free(linkLists_);
-        linkLists_ = nullptr;
+        if (element_levels_.size()) {
+            for (tableint i = 0; i < cur_element_count; i++) {
+                if (element_levels_[i] > 0)
+                    free(linkLists_[i]);
+            }
+        }
+        if (linkLists_ != nullptr) {
+            free(linkLists_);
+            linkLists_ = nullptr;
+        }
         cur_element_count = 0;
         visited_list_pool_.reset(nullptr);
     }
@@ -174,6 +256,33 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_ = ef;
     }
 
+    // return: (page_id, offset_in_page)
+    std::pair<page_id_t, size_t> get_level0_offset(tableint internal_id) const {
+        page_id_t pageid = level0_first_page_id_ + internal_id / level0_elements_per_page_;
+        size_t offset_in_page = (internal_id % level0_elements_per_page_) * size_data_per_element_;
+        return std::make_pair(pageid, offset_in_page);
+    }
+
+    // return the link list offset of internal_id
+    std::pair<page_id_t, size_t> get_higher_level_offset(tableint internal_id, int level) const {
+        // Calculate page and offset for the link list
+        size_t link_offset_entry_offset = internal_id * sizeof(size_t);
+        size_t link_offset_entry_page_id = link_offset_array_page_id_ + link_offset_entry_offset / page_size_;
+        size_t link_offset_entry_offset_in_page = link_offset_entry_offset % page_size_;
+
+        // Load the page containing the link offset entry
+        auto link_array_page = page_cache->get_page(link_offset_entry_page_id);
+
+        // Get the offset of this element's link list
+        size_t *link_offset_ptr = (size_t *)(link_array_page.get_ptr() + link_offset_entry_offset_in_page);
+        size_t link_offset = *link_offset_ptr;
+
+        // Calculate page and offset for the link list
+        size_t page_id = link_offset / page_size_;
+        size_t offset_in_page = link_offset % page_size_ + (level - 1) * size_links_per_element_;
+
+        return std::make_pair(page_id, offset_in_page);
+    }
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -220,6 +329,33 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     size_t getDeletedCount() {
         return num_deleted_;
+    }
+
+    float get_cache_hit_rate() const {
+        if (page_cache) {
+            return page_cache->get_cache_hit_rate();
+        }
+        return 0.0f;
+    }
+
+    size_t get_io_op_num() const {
+        if (page_cache) {
+            return page_cache->get_io_op_num();
+        }
+        return 0;
+    }
+
+    float get_memory_transfer_kb() const {
+        if (page_cache) {
+            return page_cache->get_memory_transfer_kb();
+        }
+        return 0.0f;
+    }
+
+    void reset_metrics_counter() {
+        if (page_cache) {
+            page_cache->reset_metrics_counter();
+        }
     }
 
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
@@ -322,19 +458,26 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (bare_bone_search || 
-            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
-            char* ep_data = getDataByInternalId(ep_id);
-            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
-            lowerBound = dist;
-            top_candidates.emplace(dist, ep_id);
-            if (!bare_bone_search && stop_condition) {
-                stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+        {
+            auto [ep_page_id, ep_offset] = get_level0_offset(ep_id);
+            PointPageLevel0 ep_page(page_cache->get_page(ep_page_id), ep_offset, this); 
+            if (bare_bone_search || 
+                // (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+                (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(ep_page.get_label())))) {
+                // char* ep_data = getDataByInternalId(ep_id);
+                char* ep_data = ep_page.get_data();
+                dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+                lowerBound = dist;
+                top_candidates.emplace(dist, ep_id);
+                if (!bare_bone_search && stop_condition) {
+                    // stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+                    stop_condition->add_point_to_result(ep_page.get_label(), ep_data, dist);
+                }
+                candidate_set.emplace(-dist, ep_id);
+            } else {
+                lowerBound = std::numeric_limits<dist_t>::max();
+                candidate_set.emplace(-lowerBound, ep_id);
             }
-            candidate_set.emplace(-dist, ep_id);
-        } else {
-            lowerBound = std::numeric_limits<dist_t>::max();
-            candidate_set.emplace(-lowerBound, ep_id);
         }
 
         visited_array[ep_id] = visited_array_tag;
@@ -359,33 +502,43 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             candidate_set.pop();
 
             tableint current_node_id = current_node_pair.second;
-            int *data = (int *) get_linklist0(current_node_id);
-            size_t size = getListCount((linklistsizeint*)data);
+            auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
+            PointPageLevel0 current_node_page(page_cache->get_page(cur_page_id), cur_off, this);
+            // int *data = (int *) get_linklist0(current_node_id);
+            int* data = (int *) current_node_page.get_neighbor_list();
+            // size_t size = getListCount((linklistsizeint*)data);
+            size_t size = current_node_page.get_neighbor_count();
 //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
             if (collect_metrics) {
                 metric_hops++;
                 metric_distance_computations+=size;
             }
 
-#ifdef USE_SSE
-            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
-#endif
+// TODO: Replace SSE to page cache readahead
+// #ifdef USE_SSE
+//             _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+//             _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+//             _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+//             _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+// #endif
 
-            for (size_t j = 1; j <= size; j++) {
+            // for (size_t j = 1; j <= size; j++) {
+            for (size_t j = 0; j < size; j++) {
                 int candidate_id = *(data + j);
 //                    if (candidate_id == 0) continue;
-#ifdef USE_SSE
-                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
-                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                _MM_HINT_T0);  ////////////
-#endif
+// #ifdef USE_SSE
+//                 _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+//                 _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+//                                 _MM_HINT_T0);  ////////////
+// #endif
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
 
-                    char *currObj1 = (getDataByInternalId(candidate_id));
+                    auto [cand_page_id, cand_off] = get_level0_offset(candidate_id);
+                    PointPageLevel0 cand_page(page_cache->get_page(cand_page_id), cand_off, this);
+
+                    // char *currObj1 = (getDataByInternalId(candidate_id));
+                    char *currObj1 = cand_page.get_data();
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
 
                     bool flag_consider_candidate;
@@ -397,17 +550,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                     if (flag_consider_candidate) {
                         candidate_set.emplace(-dist, candidate_id);
-#ifdef USE_SSE
-                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
-                                        offsetLevel0_,  ///////////
-                                        _MM_HINT_T0);  ////////////////////////
-#endif
+// #ifdef USE_SSE
+//                         _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+//                                         offsetLevel0_,  ///////////
+//                                         _MM_HINT_T0);  ////////////////////////
+// #endif
 
                         if (bare_bone_search || 
-                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            // (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(cand_page.get_label())))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
-                                stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                                // stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                                stop_condition->add_point_to_result(cand_page.get_label(), currObj1, dist);
                             }
                         }
 
@@ -421,7 +576,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             tableint id = top_candidates.top().second;
                             top_candidates.pop();
                             if (!bare_bone_search && stop_condition) {
-                                stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                                auto [page_id, off] = get_level0_offset(id);
+                                PointPageLevel0 page(page_cache->get_page(page_id), off, this);
+                                // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                                stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
                                 flag_remove_extra = stop_condition->should_remove_extra();
                             } else {
                                 flag_remove_extra = top_candidates.size() > ef;
@@ -657,6 +815,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     size_t indexFileSize() const {
         size_t size = 0;
+
+        // Original metadata
         size += sizeof(offsetLevel0_);
         size += sizeof(max_elements_);
         size += sizeof(cur_element_count);
@@ -666,26 +826,56 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size += sizeof(maxlevel_);
         size += sizeof(enterpoint_node_);
         size += sizeof(maxM_);
-
         size += sizeof(maxM0_);
         size += sizeof(M_);
         size += sizeof(mult_);
         size += sizeof(ef_construction_);
 
+        // Page cache metadata
+        size += sizeof(page_size_);
+        size += sizeof(level0_first_page_id_);
+        size += sizeof(level0_elements_per_page_);
+        size += sizeof(link_offset_array_page_id_);
+
+        // Calculate page-aligned size for level 0 data
+        size_t page_size = page_size_ > 0 ? page_size_ : 4096;
+        size_t level0_elements_per_page = page_size / size_data_per_element_;
+        if (level0_elements_per_page == 0) {
+            level0_elements_per_page = 1;
+        }
+
+        // Padding to page boundary before level 0 data
+        size_t padding = page_size - (size % page_size);
+        if (padding == page_size) padding = 0;
+        size += padding;
+
+        // Level 0 data
         size += cur_element_count * size_data_per_element_;
 
+        // Higher level links (accounting for page alignment)
         for (size_t i = 0; i < cur_element_count; i++) {
             unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
-            size += sizeof(linkListSize);
-            size += linkListSize;
+            size_t total_size = sizeof(linkListSize) + linkListSize;
+
+            // Check if we need padding for page alignment
+            size_t offset_in_page = size % page_size;
+            if (offset_in_page + total_size > page_size) {
+                size += page_size - offset_in_page; // Pad to page boundary
+            }
+
+            size += total_size;
         }
+
+        // Link offset array
+        size += cur_element_count * sizeof(size_t);
+
         return size;
     }
 
     void saveIndex(const std::string &location) {
         std::ofstream output(location, std::ios::binary);
-        std::streampos position;
 
+        // Write original metadata
         writeBinaryPOD(output, offsetLevel0_);
         writeBinaryPOD(output, max_elements_);
         writeBinaryPOD(output, cur_element_count);
@@ -701,30 +891,113 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         writeBinaryPOD(output, mult_);
         writeBinaryPOD(output, ef_construction_);
 
-        output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
+        // Write page cache metadata (default values for backward compatibility)
+        // If page_size_ is 0, this is being saved from an index created without page cache support
+        // In this case, we use a default page size and write the old format
+        size_t page_size = page_size_ > 0 ? page_size_ : 4096;  // default 4KB page
+        writeBinaryPOD(output, page_size);
 
+        // Calculate level 0 page-aligned layout
+        page_id_t level0_first_page_id = 0;
+        size_t level0_elements_per_page = page_size / size_data_per_element_;
+        if (level0_elements_per_page == 0) {
+            // Element is larger than page size, put one element per page
+            level0_elements_per_page = 1;
+        }
+        size_t level0_first_page_id_pos = output.tellp();
+        writeBinaryPOD(output, level0_first_page_id);
+        writeBinaryPOD(output, level0_elements_per_page);
+
+        // Reserve space for link offset array metadata
+        size_t link_offset_array_page_id_pos = output.tellp();
+        page_id_t link_offset_array_page_id = 0;
+        writeBinaryPOD(output, link_offset_array_page_id);
+
+        // Pad to page boundary for level 0 data using seek
+        size_t level0_start_pos = output.tellp();
+        size_t padding = page_size - (level0_start_pos % page_size);
+        if (padding == page_size) padding = 0;
+        level0_start_pos += padding;
+
+        // Update level 0 first page id after padding
+        level0_first_page_id = level0_start_pos / page_size;
+        output.seekp(level0_first_page_id_pos);
+        writeBinaryPOD(output, level0_first_page_id);
+        output.seekp(level0_start_pos);
+
+        // Write level 0 data with page alignment
         for (size_t i = 0; i < cur_element_count; i++) {
+            // Check if element fits in current page
+            size_t offset_in_page = output.tellp() % page_size;
+
+            // If element doesn't fit in current page, pad to next page
+            if (offset_in_page + size_data_per_element_ > page_size) {
+                size_t pad_size = page_size - offset_in_page;
+                output.seekp(pad_size, std::ios::cur);
+            }
+
+            // Write element data
+            const char* element_data = data_level0_memory_ + i * size_data_per_element_;
+            output.write(element_data, size_data_per_element_);
+        }
+
+        // Track link offsets for each element
+        std::vector<size_t> link_offsets;
+        link_offsets.reserve(cur_element_count);
+
+        // Write higher level links and record their offsets (with page alignment)
+        for (size_t i = 0; i < cur_element_count; i++) {
+            size_t current_pos = output.tellp();
             unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
-            writeBinaryPOD(output, linkListSize);
+
+            // Check if the link list fits in current page
+            size_t offset_in_page = current_pos % page_size;
+            if (offset_in_page + linkListSize > page_size) {
+                // Pad to page boundary using seek
+                size_t pad_size = page_size - offset_in_page;
+                output.seekp(pad_size, std::ios::cur);
+                current_pos = output.tellp();
+            }
+            link_offsets.push_back(current_pos);
+
             if (linkListSize)
                 output.write(linkLists_[i], linkListSize);
         }
+
+        // Pad to page boundary for link offset array
+        size_t link_offset_array_offset = output.tellp();
+        size_t link_array_padding = page_size - (link_offset_array_offset % page_size);
+        if (link_array_padding == page_size) link_array_padding = 0;
+        if (link_array_padding > 0) {
+            output.seekp(link_array_padding, std::ios::cur);
+            link_offset_array_offset += link_array_padding;
+        }
+
+        // Calculate page id for link offset array
+        link_offset_array_page_id = link_offset_array_offset / page_size;
+
+        // Write link offset array
+        for (size_t i = 0; i < cur_element_count; i++) {
+            writeBinaryPOD(output, link_offsets[i]);
+        }
+
+        // Update link offset array metadata in header
+        output.seekp(link_offset_array_page_id_pos);
+        writeBinaryPOD(output, link_offset_array_page_id);
+
         output.close();
     }
 
 
-    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
+    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0, size_t cache_size_i = 0) {
         std::ifstream input(location, std::ios::binary);
 
         if (!input.is_open())
             throw std::runtime_error("Cannot open file");
 
         clear();
-        // get file size:
-        input.seekg(0, input.end);
-        std::streampos total_filesize = input.tellg();
-        input.seekg(0, input.beg);
 
+        // Read original metadata
         readBinaryPOD(input, offsetLevel0_);
         readBinaryPOD(input, max_elements_);
         readBinaryPOD(input, cur_element_count);
@@ -745,76 +1018,41 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         readBinaryPOD(input, mult_);
         readBinaryPOD(input, ef_construction_);
 
+        // Read page cache metadata
+        readBinaryPOD(input, page_size_);
+        readBinaryPOD(input, level0_first_page_id_);
+        readBinaryPOD(input, level0_elements_per_page_);
+        readBinaryPOD(input, link_offset_array_page_id_);
+
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
 
-        auto pos = input.tellg();
-
-        /// Optional - check if index is ok:
-        input.seekg(cur_element_count * size_data_per_element_, input.cur);
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (input.tellg() < 0 || input.tellg() >= total_filesize) {
-                throw std::runtime_error("Index seems to be corrupted or unsupported");
-            }
-
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize != 0) {
-                input.seekg(linkListSize, input.cur);
-            }
+        // Initialize page cache for on-demand loading
+        size_t cache_size = cache_size_i;
+        if (cache_size == 0) {
+            // Default cache size: 256MB or max_elements * page_size, whichever is smaller
+            cache_size = std::min(max_elements_ * page_size_, static_cast<size_t>(256 * 1024 * 1024));
         }
-
-        // throw exception if it either corrupted or old index
-        if (input.tellg() != total_filesize)
-            throw std::runtime_error("Index seems to be corrupted or unsupported");
-
-        input.clear();
-        /// Optional check end
-
-        input.seekg(pos, input.beg);
-
-        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
-        if (data_level0_memory_ == nullptr)
-            throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
-        input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
+        page_cache = std::unique_ptr<HnswPageCache>(new HnswPageCache(location, page_size_, cache_size));
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
-
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+
         std::vector<std::mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
 
         visited_list_pool_.reset(new VisitedListPool(1, max_elements));
 
-        linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
-        if (linkLists_ == nullptr)
-            throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklists");
-        element_levels_ = std::vector<int>(max_elements);
+        // Don't load element data, link lists, or level 0 data
+        // These will be loaded on-demand during search operations
+
         revSize_ = 1.0 / mult_;
         ef_ = 10;
-        for (size_t i = 0; i < cur_element_count; i++) {
-            label_lookup_[getExternalLabel(i)] = i;
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize == 0) {
-                element_levels_[i] = 0;
-                linkLists_[i] = nullptr;
-            } else {
-                element_levels_[i] = linkListSize / size_links_per_element_;
-                linkLists_[i] = (char *) malloc(linkListSize);
-                if (linkLists_[i] == nullptr)
-                    throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklist");
-                input.read(linkLists_[i], linkListSize);
-            }
-        }
 
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (isMarkedDeleted(i)) {
-                num_deleted_ += 1;
-                if (allow_replace_deleted_) deleted_elements.insert(i);
-            }
-        }
+        // Note: In on-demand loading mode, we don't pre-load any element data
+        // The actual element data (vectors, labels, links) will be loaded via page cache
+        // when needed during search operations
 
         input.close();
 
@@ -1273,25 +1511,38 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        dist_t curdist;
+        {
+            auto [page_id, offset] = get_level0_offset(enterpoint_node_);
+            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            curdist = fstdistfunc_(query_data, page.get_data(), dist_func_param_);
+        }
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
             while (changed) {
                 changed = false;
-                unsigned int *data;
 
-                data = (unsigned int *) get_linklist(currObj, level);
-                int size = getListCount(data);
+                // unsigned int *data = (unsigned int *) get_linklist(currObj, level);
+                // int size = getListCount(data);
+                auto [page_id, offset] = get_higher_level_offset(currObj, level);
+                PointPageHigherLevel page(page_cache->get_page(page_id), offset);
+                int size = page.get_neighbor_count();
+
                 metric_hops++;
                 metric_distance_computations+=size;
 
-                tableint *datal = (tableint *) (data + 1);
+                // tableint *datal = (tableint *) (data + 1);
+                tableint *datal = page.get_neighbor_list();
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    auto [page_id, offset] = get_level0_offset(cand);
+                    PointPageLevel0 cand_page(page_cache->get_page(page_id), offset, this);
+                    // dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
 
                     if (d < curdist) {
                         curdist = d;
@@ -1317,7 +1568,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         while (top_candidates.size() > 0) {
             std::pair<dist_t, tableint> rez = top_candidates.top();
-            result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            auto [page_id, offset] = get_level0_offset(rez.second);
+            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            result.push(std::pair<dist_t, labeltype>(rez.first, page.get_label()));
             top_candidates.pop();
         }
         return result;
