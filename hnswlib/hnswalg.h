@@ -4,6 +4,7 @@
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <random>
 #include <stdlib.h>
@@ -149,6 +150,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t level0_elements_per_page_{0};  // number of elements per page in level 0
     page_id_t level0_first_page_id_{0};  // page id of the first element in level 0
     page_id_t link_offset_array_page_id_{0};  // page id of the link offset array
+
+    std::vector<tableint> id_to_store_order;  // map internal id to store id
+    std::vector<tableint> store_order_to_id;  // map store id to internal id
 
     HierarchicalNSW(
         SpaceInterface<dist_t> *s,
@@ -873,6 +877,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void saveIndex(const std::string &location) {
+        reorder_vertices_with_degree_ascending_bfs();
+
         std::ofstream output(location, std::ios::binary);
 
         // Write original metadata
@@ -937,7 +943,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
 
             // Write element data
-            const char* element_data = data_level0_memory_ + i * size_data_per_element_;
+            int origin_id = store_order_to_id[i];
+            const char* element_data = data_level0_memory_ + origin_id * size_data_per_element_;
             output.write(element_data, size_data_per_element_);
         }
 
@@ -948,7 +955,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Write higher level links and record their offsets (with page alignment)
         for (size_t i = 0; i < cur_element_count; i++) {
             size_t current_pos = output.tellp();
-            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            int origin_id = store_order_to_id[i];
+            unsigned int linkListSize = element_levels_[origin_id] > 0 ? size_links_per_element_ * element_levels_[origin_id] : 0;
 
             // Check if the link list fits in current page
             size_t offset_in_page = current_pos % page_size;
@@ -961,7 +969,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             link_offsets.push_back(current_pos);
 
             if (linkListSize)
-                output.write(linkLists_[i], linkListSize);
+                output.write(linkLists_[origin_id], linkListSize);
         }
 
         // Pad to page boundary for link offset array
@@ -1504,6 +1512,82 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return cur_c;
     }
 
+    void reorder_vertices_with_degree_ascending_bfs() {
+        int min_degree = INT_MAX;
+        int cur_id;
+        for (int i = 0; i < cur_element_count; ++i) {
+            unsigned int *data = get_linklist0(i);
+            int degree = getListCount(data);
+            if (degree < min_degree) {
+                min_degree = degree;
+                cur_id = i;
+            }
+        }
+
+        std::vector<bool> visited(cur_element_count, false);
+        id_to_store_order.resize(cur_element_count);
+        store_order_to_id.clear();
+
+        std::queue<int> bfs_queue;
+        std::vector<std::pair<int, int>> degree_id_vec;  // (degree, id)
+        bfs_queue.push(cur_id);
+        visited[cur_id] = true;
+
+        while (!bfs_queue.empty()) {
+            int count = bfs_queue.size();
+            degree_id_vec.clear();
+            for (int i = 0; i < count; ++i) {
+                int node_id = bfs_queue.front();
+                bfs_queue.pop();
+                unsigned int *data = get_linklist0(node_id);
+                int degree = getListCount(data);
+                degree_id_vec.emplace_back(degree, node_id);
+            }
+
+            // sort by degree ascending
+            std::sort(degree_id_vec.begin(), degree_id_vec.end());
+            for (auto &[_, node_id] : degree_id_vec) {
+                id_to_store_order[node_id] = store_order_to_id.size();
+                store_order_to_id.emplace_back(node_id);
+
+                unsigned int *data = get_linklist0(node_id);
+                int degree = getListCount(data);
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < degree; i++) {
+                    tableint neighbor_id = datal[i];
+                    if (!visited[neighbor_id]) {
+                        visited[neighbor_id] = true;
+                        bfs_queue.push(neighbor_id);
+                    }
+                }
+            }
+        }
+
+        assert(store_order_to_id.size() == cur_element_count);
+        assert(id_to_store_order.size() == cur_element_count);
+
+        // reorder all data structures according to store order
+        for (int i = 0; i < cur_element_count; ++i) {
+            // reorder level 0 linklist
+            unsigned int *data = get_linklist0(i);
+            int degree = getListCount(data);
+            tableint *datal = (tableint *) (data + 1);
+            for (int i = 0; i < degree; i++) {
+                datal[i] = id_to_store_order[datal[i]];
+            }
+
+            // reorder higher level linklists
+            int elem_level = element_levels_[i];
+            for (int level = 1; level <= elem_level; ++level) {
+                unsigned int *data = get_linklist(i, level);
+                int degree = getListCount(data);
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < degree; i++) {
+                    datal[i] = id_to_store_order[datal[i]];
+                }
+            }
+        }
+    }
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
