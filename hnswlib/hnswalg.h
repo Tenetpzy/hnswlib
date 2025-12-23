@@ -1587,6 +1587,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
+
+        // reorder entrypoint
+        enterpoint_node_ = id_to_store_order[enterpoint_node_];
     }
 
     std::priority_queue<std::pair<dist_t, labeltype >>
