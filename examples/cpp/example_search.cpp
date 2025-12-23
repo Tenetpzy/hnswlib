@@ -51,6 +51,13 @@ int main() {
     }
     float recall = (float)correct / max_elements;
     std::cout << "Recall of deserialized index: " << recall << "\n";
+    std::cout 
+        << "Cache hit rate: "
+        << alg_hnsw->get_cache_hit_rate() << "\n"
+        << "IO operations: "
+        << alg_hnsw->get_io_op_num() << "\n"
+        << "Memory transfer (KB): "
+        << alg_hnsw->get_memory_transfer_kb() << "\n";
 
     delete[] data;
     delete alg_hnsw;

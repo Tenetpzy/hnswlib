@@ -176,8 +176,8 @@ private:
     std::mutex lru_mutex;
 
     size_t cache_hits{0}, cache_miss{0};
-    size_t io_op_num{0};
-    size_t memory_transfer_bytes{0};
+    std::atomic_size_t io_op_num{0};
+    std::atomic_size_t memory_transfer_bytes{0};
 
     friend class PageHandler;
 };
