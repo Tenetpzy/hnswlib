@@ -61,6 +61,7 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
     auto it = id_to_page.find(page_id);
     if (it != id_to_page.end()) {
         // Page exists in cache
+        ++cache_hits;
         PageEntry* entry = it->second;
         add_page_ref(entry);
         lock.unlock();
@@ -77,6 +78,7 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
     }
 
     // Page not in cache, need to load it
+    ++cache_miss;
     PageEntry* entry = nullptr;
 
     // Try to get an available page entry from the pool
@@ -181,7 +183,8 @@ void HnswPageCache::load_from_disk(PageEntry *entry) {
     // Use pread for thread-safe, atomic read from specific offset
     off_t offset = static_cast<off_t>(entry->page_id) * page_size;
     ssize_t bytes_read = ::pread(fd, entry->data, page_size, offset);
-
+    ++io_op_num;
+    memory_transfer_bytes += static_cast<size_t>(bytes_read);
     if (bytes_read < 0) {
         throw std::runtime_error("failed to read page from disk");
     }

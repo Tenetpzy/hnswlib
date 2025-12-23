@@ -894,7 +894,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Write page cache metadata (default values for backward compatibility)
         // If page_size_ is 0, this is being saved from an index created without page cache support
         // In this case, we use a default page size and write the old format
-        size_t page_size = page_size_ > 0 ? page_size_ : 4096;  // default 4KB page
+        size_t page_size = page_size_ > 0 ? page_size_ : 32768;  // default 32KB page
         writeBinaryPOD(output, page_size);
 
         // Calculate level 0 page-aligned layout
