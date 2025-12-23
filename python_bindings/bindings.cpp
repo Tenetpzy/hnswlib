@@ -193,13 +193,14 @@ class Index {
         size_t maxElements,
         size_t M,
         size_t efConstruction,
+        size_t page_size,
         size_t random_seed,
         bool allow_replace_deleted) {
         if (appr_alg) {
             throw std::runtime_error("The index is already initiated.");
         }
         cur_l = 0;
-        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, M, efConstruction, random_seed, allow_replace_deleted);
+        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, M, efConstruction, page_size, random_seed, allow_replace_deleted);
         index_inited = true;
         ep_added = false;
         appr_alg->ef_ = default_ef;
@@ -497,11 +498,16 @@ class Index {
         new_index->seed = d["seed"].cast<size_t>();
 
         if (index_inited_) {
+            size_t page_size = 4096;
+            if (d.contains("page_size")) {
+                page_size = d["page_size"].cast<size_t>();
+            }
             new_index->appr_alg = new hnswlib::HierarchicalNSW<dist_t>(
                 new_index->l2space,
                 d["max_elements"].cast<size_t>(),
                 d["M"].cast<size_t>(),
                 d["ef_construction"].cast<size_t>(),
+                page_size,
                 new_index->seed);
             new_index->cur_l = d["cur_element_count"].cast<size_t>();
         }
@@ -937,6 +943,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("max_elements"),
             py::arg("M") = 16,
             py::arg("ef_construction") = 200,
+            py::arg("page_size") = 4096,
             py::arg("random_seed") = 100,
             py::arg("allow_replace_deleted") = false)
         .def("knn_query",
