@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <sys/queue.h>
 #include <atomic>
 #include <condition_variable>
@@ -8,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "iobackend.h"
 
 namespace hnswlib {
 
@@ -40,8 +42,18 @@ class PageEntry {
         state = State::NotInCache;
     }
 
+    void wait_until_ready() {
+        if (state != State::InCache) {  // check without lock is safe, state changes to NotInCache only when refcount -> 0
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this] {
+                return state == State::InCache;
+            });
+        }
+    }
+
     friend class HnswPageCache;
     friend class PageHandler;
+    friend class ReadAheadPageHandler;
 };
 
 /*
@@ -77,6 +89,44 @@ private:
     PageEntry *entry;
 
     friend class HnswPageCache;
+    friend class ReadAheadPageHandler;
+};
+
+/*
+ * The return handler of readahead_page
+ * Caller can wait for page ready through this handler
+ */
+class ReadAheadPageHandler {
+public:
+    // Should call sub_page_ref of HnswPageCache to decrease the reference count
+    ~ReadAheadPageHandler();
+
+    ReadAheadPageHandler(const ReadAheadPageHandler&) = delete;
+    ReadAheadPageHandler& operator=(const ReadAheadPageHandler&) = delete;
+    ReadAheadPageHandler(ReadAheadPageHandler&& other) noexcept: cache(other.cache), entry(other.entry) {
+        other.cache = nullptr;
+        other.entry = nullptr;
+    }
+    ReadAheadPageHandler& operator=(ReadAheadPageHandler&& other) noexcept;
+
+    // Wait until the page is ready in cache
+    PageHandler wait_ready() && {
+        if (entry) {
+            entry->wait_until_ready();
+        }
+        auto ret = PageHandler(cache, entry);
+        cache = nullptr;
+        entry = nullptr;
+        return ret;
+    }
+
+private:
+    ReadAheadPageHandler(HnswPageCache *cache, PageEntry *entry): cache(cache), entry(entry) {}
+
+    HnswPageCache *cache;
+    PageEntry *entry;
+
+    friend class HnswPageCache;
 };
 
 /*
@@ -105,14 +155,15 @@ public:
      */
     PageHandler get_page(page_id_t page_id);
 
-    // /*
-    //  * Async prefetch the page into cache, should not block caller
-    //  * Note: You should implement a threadpool or something to support async loading
-    //  * If the page is already in cache, do nothing
-    //  * If the page is not in cache, load it from disk asynchronously
-    //  * The page's refcount should be initialized as 0
-    //  */
-    // void readahead_page(page_id_t page_id);
+    /*
+     * Async prefetch the page into cache, should not block caller
+     * If the page is already in cache, just return the handler with increased refcount
+     * If the page is not in cache, load it from disk asynchronously
+     * If the cache is full and cannot be evicted, just return empty optional
+     * ReadAheadPageHandler holds an reference count of page
+     * Caller can wait on the ReadAheadPageHandler until page ready
+     */
+    std::optional<ReadAheadPageHandler> readahead_page(page_id_t page_id);
 
     float get_cache_hit_rate() const {
         size_t total = cache_hits + cache_miss;
@@ -155,6 +206,8 @@ private:
 
     void load_from_disk(PageEntry *entry);
 
+    void load_from_disk_async(PageEntry *entry);
+
     TAILQ_HEAD(LRUList, PageEntry);
 
 private:
@@ -175,11 +228,14 @@ private:
     std::condition_variable evict_cv; // for evicting thread to wait for evictable page entry
     std::mutex lru_mutex;
 
+    IOBackend io_backend;
+
     size_t cache_hits{0}, cache_miss{0};
     std::atomic_size_t io_op_num{0};
     std::atomic_size_t memory_transfer_bytes{0};
 
     friend class PageHandler;
+    friend class ReadAheadPageHandler;
 };
 
 } // namespace hnswlib
