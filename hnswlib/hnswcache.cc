@@ -122,13 +122,6 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         lock.unlock();
         load_from_disk(entry);
 
-        {
-            // Update state to InCache
-            std::unique_lock<std::mutex> entry_lock(entry->mtx);
-            entry->state = PageEntry::State::InCache;
-        }
-        entry->cv.notify_all();
-
         return PageHandler(this, entry);
     }
 
@@ -247,6 +240,8 @@ void HnswPageCache::load_from_disk(PageEntry *entry) {
     ssize_t bytes_read = ::pread(fd, entry->data, page_size, offset);
     ++io_op_num;
     memory_transfer_bytes += static_cast<size_t>(bytes_read);
+    entry->state.store(PageEntry::State::InCache, std::memory_order_release);
+    entry->state.notify_all();
     if (bytes_read < 0) {
         throw std::runtime_error("failed to read page from disk");
     }
@@ -262,13 +257,8 @@ void HnswPageCache::load_from_disk_async(PageEntry *entry) {
         [this, entry]() {
             ++io_op_num;
             memory_transfer_bytes += page_size;
-            {
-                // TODO: 如果readahead_page的调用者根本没有使用Page就扔掉了，
-                // 那么它会被加入LRU list，然后又被evict，怎么办？
-                std::unique_lock<std::mutex> entry_lock(entry->mtx);
-                entry->state = PageEntry::State::InCache;
-            }
-            entry->cv.notify_all();
+            entry->state.store(PageEntry::State::InCache, std::memory_order_release);
+            entry->state.notify_all();
             sub_page_ref(entry);
         }
     );

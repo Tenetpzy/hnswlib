@@ -30,9 +30,7 @@ class PageEntry {
     TAILQ_ENTRY(PageEntry) entry;
     bool in_lru_list;  // protected by lru lock
 
-    State state;
-    std::condition_variable cv; // for waiting entry loading threads
-    std::mutex mtx; // for state and cv
+    std::atomic<State> state;
 
     PageEntry(): data(nullptr), in_lru_list(false), ref_count(0), state(State::NotInCache) {}
 
@@ -43,17 +41,16 @@ class PageEntry {
     }
 
     void wait_until_ready() {
-        if (state != State::InCache) {  // check without lock is safe, state changes to NotInCache only when refcount -> 0
-            std::unique_lock<std::mutex> lock(mtx);
-            cv.wait(lock, [this] {
-                return state == State::InCache;
-            });
-        }
+        auto state_val = state.load(std::memory_order_acquire);
+        if (state_val != State::InCache)
+            state.wait(state_val, std::memory_order_acquire);
     }
 
     friend class HnswPageCache;
     friend class PageHandler;
     friend class ReadAheadPageHandler;
+
+    static_assert(std::atomic<State>::is_always_lock_free, "State atomic is not lock free");
 };
 
 /*

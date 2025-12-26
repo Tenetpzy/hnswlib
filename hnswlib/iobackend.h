@@ -4,10 +4,7 @@
 #include <liburing.h>
 #include <memory>
 #include <sys/types.h>
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
+#include "mpsc.h"
 
 namespace hnswlib {
 
@@ -36,51 +33,25 @@ public:
     IOBackend(const IOBackend&) = delete;
     IOBackend& operator=(const IOBackend&) = delete;
 
-    // submit to working thread (thread-safe, multiple callers)
+    // submit to task_queue
     void submit_io_task(std::unique_ptr<HnswIOTask> task);
 
     // working thread main loop
+    // outer loop:
+    // wait_for_data_or_stop on task_queue, if stop, return
+    // inner loop:
+    // try_dequeue from task_queue, if result is not empty, continue inner loop, else break inner loop
+    // construct pread io_uring_sqe and submit it to io_uring, note: transfer unique_ptr to raw pointer and store in user_data
+    // poll for completion events(do not enter kernel for waiting, just poll), for each event, recover unique_ptr<HnswIOTask> from user_data, call its callback
+    // if all submitted tasks are done, go back to outer loop, else continue inner loop
     void run();
 
     // signal stop and join worker thread
     void stop();
 
 private:
-    // MPSC channel node
-    struct TaskNode {
-        std::unique_ptr<HnswIOTask> task;
-        std::atomic<TaskNode*> next;
-        TaskNode(std::unique_ptr<HnswIOTask> t) : task(std::move(t)), next(nullptr) {}
-    };
-
-    // lock-free fetch from mpsc channel, returns nullptr if empty
-    TaskNode* mpsc_try_pop();
-
-    // submit one task to io_uring
-    void submit_one_task(HnswIOTask *task);
-
-    // process completed io operations
-    void process_completions(size_t batch_count);
-
-private:
-    // io_uring resources (RAII managed)
-    io_uring ring_;
-
-    // MPSC channel (lock-free queue)
-    TaskNode* mpsc_head_;  // consumer visible
-    std::atomic<TaskNode*> mpsc_tail_;               // producer visible (needs CAS)
-
-    // synchronization
-    std::atomic<bool> stop_flag_;
-    std::condition_variable cv_;
-    std::mutex cv_mutex_;
-
-    // task tracking
-    std::atomic<size_t> pending_tasks_;
-
-    // worker thread
-    std::thread worker_thread_;
-    std::atomic<bool> running_;
+    io_uring ring;
+    MpscBlockingQueue<std::unique_ptr<HnswIOTask>> task_queue;
 };
 
 } // namespace hnswlib
