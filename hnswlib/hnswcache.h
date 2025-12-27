@@ -20,6 +20,7 @@ class PageEntry {
     enum class State {
         InCache,
         Loading,
+        LoadingHasWaiter,
         NotInCache
     };
 
@@ -41,9 +42,22 @@ class PageEntry {
     }
 
     void wait_until_ready() {
+        // state only has Loading -> LoadingHasWaiter -> InCache tranfer
         auto state_val = state.load(std::memory_order_acquire);
-        if (state_val != State::InCache)
-            state.wait(state_val, std::memory_order_acquire);
+        if (state_val == State::InCache) {
+            return;
+        } else if (state_val == State::Loading) {
+            if (state.compare_exchange_strong(state_val, State::LoadingHasWaiter, std::memory_order_seq_cst)) {
+                // changed state Loading -> LoadingHasWaiter
+                state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+            } else if (state_val == State::LoadingHasWaiter) {
+                // other thread changed state Loading -> LoadingHasWaiter
+                state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+            } 
+            // else if state_val == InCache, just return
+        } else {  // state_val == LoadingHasWaiter
+            state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+        }
     }
 
     friend class HnswPageCache;
@@ -161,6 +175,11 @@ public:
      * Caller can wait on the ReadAheadPageHandler until page ready
      */
     std::optional<ReadAheadPageHandler> readahead_page(page_id_t page_id);
+    void readahead_page_async(page_id_t page_id);
+
+    size_t get_avail_page_count() const {
+        return avail_page_entries.size();
+    }
 
     float get_cache_hit_rate() const {
         size_t total = cache_hits + cache_miss;

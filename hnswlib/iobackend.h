@@ -4,6 +4,7 @@
 #include <liburing.h>
 #include <memory>
 #include <sys/types.h>
+#include <thread>
 #include "mpsc.h"
 
 namespace hnswlib {
@@ -23,7 +24,7 @@ struct HnswIOTask {
 
 class IOBackend {
 public:
-    // initialize io_uring, start single working thread
+    // initialize io_uring, queue depth 256, start single working thread
     IOBackend();
 
     // RAII destructor
@@ -40,8 +41,8 @@ public:
     // outer loop:
     // wait_for_data_or_stop on task_queue, if stop, return
     // inner loop:
-    // try_dequeue from task_queue, if result is not empty, continue inner loop, else break inner loop
-    // construct pread io_uring_sqe and submit it to io_uring, note: transfer unique_ptr to raw pointer and store in user_data
+    // continue try_dequeue from task_queue until result is empty or not enough sqes
+    // construct pread io_uring_sqe for tasks and submit it to io_uring, note: transfer unique_ptr to raw pointer and store in user_data
     // poll for completion events(do not enter kernel for waiting, just poll), for each event, recover unique_ptr<HnswIOTask> from user_data, call its callback
     // if all submitted tasks are done, go back to outer loop, else continue inner loop
     void run();
@@ -52,6 +53,7 @@ public:
 private:
     io_uring ring;
     MpscBlockingQueue<std::unique_ptr<HnswIOTask>> task_queue;
+    std::thread worker_thread;
 };
 
 } // namespace hnswlib

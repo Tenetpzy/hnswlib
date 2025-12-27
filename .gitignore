@@ -16,3 +16,5 @@ CLAUDE.md
 .doc
 compile_commands.json
 .clangd
+*.svg
+*.data

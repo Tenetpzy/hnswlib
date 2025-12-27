@@ -1,4 +1,5 @@
 #include "../../hnswlib/hnswlib.h"
+#include <unistd.h>
 
 
 int main() {
@@ -39,12 +40,20 @@ int main() {
     // Serialize index
     std::string hnsw_path = "hnsw.bin";
     alg_hnsw->saveIndex(hnsw_path);
+    // output hnsw.bin size
+    std::ifstream in(hnsw_path, std::ifstream::ate | std::ifstream::binary);
+    std::cout << "Serialized index size: " << in.tellg() << " bytes\n";
+    sleep(3);
+
     delete alg_hnsw;
 
     // Deserialize index and check recall
     alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, 98304);
     float correct = 0;
     for (int i = 0; i < max_elements; i++) {
+        if (i % 100 == 0) {
+            std::cout << "Searching for element " << i << "/" << max_elements << "\n";
+        }
         std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + i * dim, 1);
         hnswlib::labeltype label = result.top().second;
         if (label == i) correct++;

@@ -135,14 +135,12 @@ std::optional<ReadAheadPageHandler> HnswPageCache::readahead_page(page_id_t page
     // Check if the page is already in cache
     auto it = id_to_page.find(page_id);
     if (it != id_to_page.end()) {
-        ++cache_hits;
         PageEntry* entry = it->second;
         add_page_ref(entry);
         return ReadAheadPageHandler(this, entry);
     }
 
     // Page not in cache, need to load it
-    ++cache_miss;
     PageEntry* entry = nullptr;
 
     // Try to get an available page entry from the pool
@@ -177,6 +175,50 @@ std::optional<ReadAheadPageHandler> HnswPageCache::readahead_page(page_id_t page
     }
 
     return std::nullopt;
+}
+
+void HnswPageCache::readahead_page_async(page_id_t page_id) {
+    std::unique_lock<std::mutex> lock(lru_mutex);
+
+    // Check if the page is already in cache
+    auto it = id_to_page.find(page_id);
+    if (it != id_to_page.end()) {
+        return;
+    }
+
+    // Page not in cache, need to load it
+    PageEntry* entry = nullptr;
+
+    // Try to get an available page entry from the pool
+    if (!avail_page_entries.empty()) {
+        entry = avail_page_entries.back();
+        avail_page_entries.pop_back();
+    } else {
+        // No available entries, try to evict one from LRU list
+        if (!TAILQ_EMPTY(&lru_list)) {
+            entry = evict_one_for_use();
+        } else {
+            // No evictable entries, cannot readahead now
+            return;
+        }
+    }
+
+    if (entry) {
+        // Initialize the new page entry
+        entry->page_id = page_id;
+
+        // don't need to lock entry->mtx here since no other thread can access this entry yet
+        entry->state = PageEntry::State::Loading;
+        id_to_page[page_id] = entry;
+        add_page_ref(entry);  // for readahead thread, when Loading, entry cannot be evicted
+
+        // Load page from disk without holding the lru lock
+        lock.unlock();
+        load_from_disk_async(entry);
+        return;
+    }
+
+    return;
 }
 
 // caller should hold lru_mutex
@@ -240,8 +282,9 @@ void HnswPageCache::load_from_disk(PageEntry *entry) {
     ssize_t bytes_read = ::pread(fd, entry->data, page_size, offset);
     ++io_op_num;
     memory_transfer_bytes += static_cast<size_t>(bytes_read);
-    entry->state.store(PageEntry::State::InCache, std::memory_order_release);
-    entry->state.notify_all();
+    auto old_state = entry->state.exchange(PageEntry::State::InCache, std::memory_order_release);
+    if (old_state == PageEntry::State::LoadingHasWaiter)
+        entry->state.notify_all();
     if (bytes_read < 0) {
         throw std::runtime_error("failed to read page from disk");
     }
@@ -257,8 +300,9 @@ void HnswPageCache::load_from_disk_async(PageEntry *entry) {
         [this, entry]() {
             ++io_op_num;
             memory_transfer_bytes += page_size;
-            entry->state.store(PageEntry::State::InCache, std::memory_order_release);
-            entry->state.notify_all();
+            auto old_state = entry->state.exchange(PageEntry::State::InCache, std::memory_order_release);
+            if (old_state == PageEntry::State::LoadingHasWaiter)
+                entry->state.notify_all();
             sub_page_ref(entry);
         }
     );

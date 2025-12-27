@@ -24,8 +24,8 @@ class HierarchicalNSW;
 class PointPageLevel0 {
 public:
     template<typename dist_t>
-    PointPageLevel0(PageHandler&& ph, size_t base_offset, const HierarchicalNSW<dist_t> *hnsw)
-        : page_handler(std::move(ph)) {
+    PointPageLevel0(PageHandler& ph, size_t base_offset, const HierarchicalNSW<dist_t> *hnsw)
+        : page_handler(ph) {
         neighbor_count_offset = base_offset + hnsw->offsetLevel0_;
         neighbor_list_offset = neighbor_count_offset + 4;
         data_offset = base_offset + hnsw->offsetData_;
@@ -58,7 +58,7 @@ public:
     }
 
 private:
-    PageHandler page_handler;
+    PageHandler& page_handler;
     int neighbor_count_offset;
     int neighbor_list_offset;
     int data_offset;
@@ -462,11 +462,53 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+        
+        // std::unordered_map<page_id_t, PageHandler> cur_level_node_pages;
+        // std::unordered_map<page_id_t, ReadAheadPageHandler> cur_level_node_readahead_pages;
+        // // assign to ⬆ when searching into next layer
+        // std::unordered_map<page_id_t, PageHandler> cur_level_neighbor_pages;
+        // std::unordered_map<page_id_t, ReadAheadPageHandler> cur_level_neighbor_readahead_pages;
+        // // assign to ⬆ when searching into next layer
+        // std::unordered_map<page_id_t, ReadAheadPageHandler> cand_node_neighbor_readahead_pages;  // dist(cand_neighbor, cur) == 2, clear when searching next layer
+
+        // auto get_page = [this](
+        //     std::unordered_map<page_id_t, PageHandler>& pages, 
+        //     std::unordered_map<page_id_t, ReadAheadPageHandler>& readahead_pages,
+        //     page_id_t page_id) -> PageHandler& {
+        //     if (pages.contains(page_id)) {
+        //         return pages.at(page_id);
+        //     }
+        //     else if (readahead_pages.contains(page_id)) {
+        //         auto readahead_handler = std::move(readahead_pages.at(page_id));
+        //         readahead_pages.erase(page_id);
+        //         auto handler = std::move(readahead_handler).wait_ready();
+        //         pages.emplace(page_id, std::move(handler));
+        //         return pages.at(page_id);
+        //     }
+        //     else {
+        //         auto handler = page_cache->get_page(page_id);
+        //         pages.emplace(page_id, std::move(handler));
+        //         return pages.at(page_id);
+        //     }
+        // };
+
+        // auto readahead_page = [this](
+        //     std::unordered_map<page_id_t, ReadAheadPageHandler>& readahead_pages,
+        //     page_id_t page_id) {
+        //     if (readahead_pages.contains(page_id)) {
+        //         return;
+        //     }
+        //     auto handler = page_cache->readahead_page(page_id);
+        //     if (handler) {
+        //         readahead_pages.emplace(page_id, std::move(handler.value()));
+        //     }
+        // };
 
         dist_t lowerBound;
         {
             auto [ep_page_id, ep_offset] = get_level0_offset(ep_id);
-            PointPageLevel0 ep_page(page_cache->get_page(ep_page_id), ep_offset, this); 
+            auto ep_page_handler = page_cache->get_page(ep_page_id);
+            PointPageLevel0 ep_page(ep_page_handler, ep_offset, this); 
             if (bare_bone_search || 
                 // (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
                 (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(ep_page.get_label())))) {
@@ -480,6 +522,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     stop_condition->add_point_to_result(ep_page.get_label(), ep_data, dist);
                 }
                 candidate_set.emplace(-dist, ep_id);
+
+                // it will be assigned to cur_level_node_pages when searching begins
+                // cur_level_neighbor_pages.emplace(ep_page_id, std::move(ep_page_handler));
             } else {
                 lowerBound = std::numeric_limits<dist_t>::max();
                 candidate_set.emplace(-lowerBound, ep_id);
@@ -488,60 +533,89 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidate_set.empty()) {
-            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
-            dist_t candidate_dist = -current_node_pair.first;
+        bool flag_stop_search = false;
+        while (!candidate_set.empty() && !flag_stop_search) {
+            // layer based search for using page cache
+            // Update Layer pages and readahead pages data structure
+            // std::swap(cur_level_node_pages, cur_level_neighbor_pages);  // last level neighbor pages become current level node pages
+            // std::swap(cur_level_node_readahead_pages, cur_level_neighbor_readahead_pages); // last level neighbor readahead pages become current level node readahead pages
+            // std::swap(cur_level_neighbor_readahead_pages, cand_node_neighbor_readahead_pages);  // last level candidate neighbor readahead pages become current level neighbor readahead pages
+            // cur_level_neighbor_pages.clear();  // clear last level node pages
+            // cand_node_neighbor_readahead_pages.clear();  // clear last level neighbor readahead pages
 
-            bool flag_stop_search;
-            if (bare_bone_search) {
-                flag_stop_search = candidate_dist > lowerBound;
-            } else {
-                if (stop_condition) {
-                    flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
+            auto layer_count = candidate_set.size();
+            while (layer_count--) {
+                std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+                dist_t candidate_dist = -current_node_pair.first;
+
+                if (bare_bone_search) {
+                    flag_stop_search = candidate_dist > lowerBound;
                 } else {
-                    flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
+                    if (stop_condition) {
+                        flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
+                    } else {
+                        flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
+                    }
                 }
-            }
-            if (flag_stop_search) {
-                break;
-            }
-            candidate_set.pop();
+                if (flag_stop_search) {
+                    break;
+                }
+                candidate_set.pop();
 
-            tableint current_node_id = current_node_pair.second;
-            auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
-            PointPageLevel0 current_node_page(page_cache->get_page(cur_page_id), cur_off, this);
-            // int *data = (int *) get_linklist0(current_node_id);
-            int* data = (int *) current_node_page.get_neighbor_list();
-            // size_t size = getListCount((linklistsizeint*)data);
-            size_t size = current_node_page.get_neighbor_count();
-//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
-            if (collect_metrics) {
-                metric_hops++;
-                metric_distance_computations+=size;
-            }
+                tableint current_node_id = current_node_pair.second;
+                auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
+                auto cur_node_page_handler = page_cache->get_page(cur_page_id);
+                PointPageLevel0 current_node_page(cur_node_page_handler, cur_off, this);
 
-// TODO: Replace SSE to page cache readahead
-// #ifdef USE_SSE
-//             _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-//             _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-//             _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-//             _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
-// #endif
+                // int *data = (int *) get_linklist0(current_node_id);
+                int* data = (int *) current_node_page.get_neighbor_list();
+                // size_t size = getListCount((linklistsizeint*)data);
+                size_t size = current_node_page.get_neighbor_count();
+    //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+                if (collect_metrics) {
+                    metric_hops++;
+                    metric_distance_computations+=size;
+                }
 
-            // for (size_t j = 1; j <= size; j++) {
-            for (size_t j = 0; j < size; j++) {
-                int candidate_id = *(data + j);
-//                    if (candidate_id == 0) continue;
-// #ifdef USE_SSE
-//                 _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
-//                 _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-//                                 _MM_HINT_T0);  ////////////
-// #endif
-                if (!(visited_array[candidate_id] == visited_array_tag)) {
+    // TODO: Replace SSE to page cache readahead
+    #ifdef USE_SSE
+                // _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+                _mm_prefetch((char *) (visited_array + *data), _MM_HINT_T0);
+                // _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                _mm_prefetch((char *) (visited_array + *data + 64), _MM_HINT_T0);
+                // _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                // _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+                _mm_prefetch((char *) (data + 1), _MM_HINT_T0);
+    #endif
+
+                // for (size_t j = 1; j <= size; j++) {
+                for (size_t j = 0; j < size; j++) {
+                    int candidate_id = *(data + j);
+    //                    if (candidate_id == 0) continue;
+    #ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                    // _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                    //                 _MM_HINT_T0);  ////////////
+    #endif
+                    
+                    if (visited_array[candidate_id] == visited_array_tag)
+                        continue;
+
                     visited_array[candidate_id] = visited_array_tag;
 
                     auto [cand_page_id, cand_off] = get_level0_offset(candidate_id);
-                    PointPageLevel0 cand_page(page_cache->get_page(cand_page_id), cand_off, this);
+
+                    // readahead next cand page
+                    // if (j + 1 < size) {
+                    //     int next_cand_id = *(data + j + 1);
+                    //     auto [next_cand_page_id, next_cand_off] = get_level0_offset(next_cand_id);
+                    //     if (cand_page_id != next_cand_page_id) {
+                    //         page_cache->readahead_page_async(next_cand_page_id);
+                    //     }
+                    // }
+
+                    auto cand_page_handler = page_cache->get_page(cand_page_id);
+                    PointPageLevel0 cand_page(cand_page_handler, cand_off, this);
 
                     // char *currObj1 = (getDataByInternalId(candidate_id));
                     char *currObj1 = cand_page.get_data();
@@ -554,47 +628,49 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
                     }
 
-                    if (flag_consider_candidate) {
-                        candidate_set.emplace(-dist, candidate_id);
+                    if (!flag_consider_candidate)
+                        continue;
+                    
+                    candidate_set.emplace(-dist, candidate_id);
 // #ifdef USE_SSE
 //                         _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
 //                                         offsetLevel0_,  ///////////
 //                                         _MM_HINT_T0);  ////////////////////////
 // #endif
 
-                        if (bare_bone_search || 
-                            // (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
-                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(cand_page.get_label())))) {
-                            top_candidates.emplace(dist, candidate_id);
-                            if (!bare_bone_search && stop_condition) {
-                                // stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
-                                stop_condition->add_point_to_result(cand_page.get_label(), currObj1, dist);
-                            }
-                        }
-
-                        bool flag_remove_extra = false;
+                    if (bare_bone_search || 
+                        // (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                        (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(cand_page.get_label())))) {
+                        top_candidates.emplace(dist, candidate_id);
                         if (!bare_bone_search && stop_condition) {
+                            // stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                            stop_condition->add_point_to_result(cand_page.get_label(), currObj1, dist);
+                        }
+                    }
+
+                    bool flag_remove_extra = false;
+                    if (!bare_bone_search && stop_condition) {
+                        flag_remove_extra = stop_condition->should_remove_extra();
+                    } else {
+                        flag_remove_extra = top_candidates.size() > ef;
+                    }
+                    while (flag_remove_extra) {
+                        tableint id = top_candidates.top().second;
+                        top_candidates.pop();
+                        if (!bare_bone_search && stop_condition) {
+                            auto [page_id, off] = get_level0_offset(id);
+                            auto page_handler = page_cache->get_page(page_id);
+                            PointPageLevel0 page(page_handler, off, this);
+                            // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                            stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
                             flag_remove_extra = stop_condition->should_remove_extra();
                         } else {
                             flag_remove_extra = top_candidates.size() > ef;
                         }
-                        while (flag_remove_extra) {
-                            tableint id = top_candidates.top().second;
-                            top_candidates.pop();
-                            if (!bare_bone_search && stop_condition) {
-                                auto [page_id, off] = get_level0_offset(id);
-                                PointPageLevel0 page(page_cache->get_page(page_id), off, this);
-                                // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
-                                stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
-                                flag_remove_extra = stop_condition->should_remove_extra();
-                            } else {
-                                flag_remove_extra = top_candidates.size() > ef;
-                            }
-                        }
-
-                        if (!top_candidates.empty())
-                            lowerBound = top_candidates.top().first;
                     }
+
+                    if (!top_candidates.empty())
+                        lowerBound = top_candidates.top().first;
                 }
             }
         }
@@ -1603,7 +1679,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t curdist;
         {
             auto [page_id, offset] = get_level0_offset(enterpoint_node_);
-            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            auto page_handler = page_cache->get_page(page_id);
+            PointPageLevel0 page(page_handler, offset, this);
             curdist = fstdistfunc_(query_data, page.get_data(), dist_func_param_);
         }
 
@@ -1629,7 +1706,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         throw std::runtime_error("cand error");
 
                     auto [page_id, offset] = get_level0_offset(cand);
-                    PointPageLevel0 cand_page(page_cache->get_page(page_id), offset, this);
+                    auto page_handler = page_cache->get_page(page_id);
+                    PointPageLevel0 cand_page(page_handler, offset, this);
                     // dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
 
@@ -1658,7 +1736,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         while (top_candidates.size() > 0) {
             std::pair<dist_t, tableint> rez = top_candidates.top();
             auto [page_id, offset] = get_level0_offset(rez.second);
-            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            auto page_handler = page_cache->get_page(page_id);
+            PointPageLevel0 page(page_handler, offset, this);
             // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             result.push(std::pair<dist_t, labeltype>(rez.first, page.get_label()));
             top_candidates.pop();

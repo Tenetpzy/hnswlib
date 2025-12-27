@@ -3,7 +3,6 @@
 #include <atomic>
 #include <utility>
 #include <optional>
-#include <new>
 
 template <typename T>
 class MpscBlockingQueue {
@@ -72,13 +71,14 @@ public:
         prev_head->next.store(new_node, std::memory_order_release);
 
         // 2. 唤醒逻辑
-        // 我们不只是检查 WAITING，而是尝试将其交换为 ACTIVE。
         // 如果原来的值是 WAITING，说明消费者正在准备睡或已经睡了，我们需要 notify。
-        // 如果原来的值是 ACTIVE，说明消费者醒着，或者其他生产者已经叫醒它了，不需要 notify。
+        // 如果原来的值是 ACTIVE，说明消费者醒着，不需要 notify。
         // seq_cst: 不能使用acq_rel内存序，原因: 避免store-load重排
         // 此操作为read-modify-write操作，如果read为acquire，则上面的store可能被重排到read state之后
         // 导致消费者误认为没有数据而睡眠，错过唤醒
-        if (state.exchange(ACTIVE, std::memory_order_seq_cst) == WAITING) {
+        if (state.load(std::memory_order_seq_cst) == WAITING) {
+            // 只有在消费者可能睡着的时候才调用 notify，减少系统调用开销
+            state.store(ACTIVE, std::memory_order_relaxed);
             state.notify_one();
         }
     }
