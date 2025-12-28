@@ -1,4 +1,5 @@
 #include "iobackend.h"
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -30,6 +31,8 @@ void IOBackend::submit_io_task(std::unique_ptr<HnswIOTask> task) {
 }
 
 void IOBackend::run() {
+    constexpr auto poll_timeout = std::chrono::microseconds(100);
+
     while (true) {
         // Outer loop: wait for data or stop signal
         auto task_opt = task_queue.wait_for_data_or_stop();
@@ -40,6 +43,7 @@ void IOBackend::run() {
 
         std::vector<std::unique_ptr<HnswIOTask>> batch_tasks;
         uint32_t remaining = 0;
+        auto start = std::chrono::steady_clock::now();
 
         do {
             // Try to dequeue more tasks
@@ -52,6 +56,9 @@ void IOBackend::run() {
                 batch_tasks.push_back(std::move(next_task.value()));
             }
 
+            if (!batch_tasks.size())
+                start = std::chrono::steady_clock::now();
+
             // Submit all tasks to io_uring
             for (auto& task : batch_tasks) {
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
@@ -61,11 +68,11 @@ void IOBackend::run() {
 
                 // Setup pread operation
                 io_uring_prep_read(sqe, task->fd, task->buffer, task->size, task->offset);
-                
+
                 // Transfer ownership: convert unique_ptr to raw pointer and store in user_data
                 io_uring_sqe_set_data(sqe, task.release());
             }
-            
+
             // Submit all prepared operations
             int submitted = io_uring_submit(&ring);
             if (submitted < 0) {
@@ -79,11 +86,11 @@ void IOBackend::run() {
             while (true) {
                 struct io_uring_cqe* cqe;
                 int ret = io_uring_peek_cqe(&ring, &cqe);
-                
+
                 if (ret == -EAGAIN) {
                     break;
                 }
-                
+
                 if (ret < 0) {
                     throw std::runtime_error("io_uring_peek_cqe failed: " + std::string(strerror(-ret)));
                 }
@@ -95,7 +102,7 @@ void IOBackend::run() {
                 if (cqe->res < 0) {
                     std::cerr << "IO operation failed: " << strerror(-cqe->res) << std::endl;
                 } else if (static_cast<size_t>(cqe->res) != task_ptr->size) {
-                    std::cerr << "Incomplete read: expected " << task_ptr->size 
+                    std::cerr << "Incomplete read: expected " << task_ptr->size
                             << " bytes, got " << cqe->res << " bytes" << ", offset " << task_ptr->offset << std::endl;
                 }
 
@@ -103,7 +110,8 @@ void IOBackend::run() {
                 io_uring_cqe_seen(&ring, cqe);
                 --remaining;
             }
-        } while (remaining > 0);
+        } while (remaining > 0 || 
+                 std::chrono::steady_clock::now() - start < poll_timeout);
     }
 }
 
