@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <sys/queue.h>
 #include <atomic>
@@ -13,8 +14,11 @@
 
 namespace hnswlib {
 
+static constexpr size_t CACHE_LINE_SIZE = 64;
+
 typedef unsigned int page_id_t;
 class HnswPageCache;
+TAILQ_HEAD(ListHead, PageEntry);
 
 class PageEntry {
     enum class State {
@@ -24,21 +28,23 @@ class PageEntry {
         NotInCache
     };
 
-    page_id_t page_id;
+    alignas(64) std::atomic_uint32_t ref_count;
+    alignas(64) std::atomic<State> state;
+
+    alignas(64)
     char *data;
-    std::atomic_uint32_t ref_count;
-
+    ListHead *list_head;  // which list the entry is in, nullptr if using
+    uint32_t access_count;  // for LRU-K
+    page_id_t page_id;
     TAILQ_ENTRY(PageEntry) entry;
-    bool in_lru_list;  // protected by lru lock
 
-    std::atomic<State> state;
-
-    PageEntry(): data(nullptr), in_lru_list(false), ref_count(0), state(State::NotInCache) {}
+    PageEntry(): ref_count(0), state(State::NotInCache), data(nullptr), list_head(nullptr), access_count(0) {}
 
     void release() {
         ref_count = 0;
-        in_lru_list = false;
         state = State::NotInCache;
+        list_head = nullptr;
+        access_count = 0;
     }
 
     void wait_until_ready() {
@@ -66,6 +72,8 @@ class PageEntry {
 
     static_assert(std::atomic<State>::is_always_lock_free, "State atomic is not lock free");
 };
+
+static_assert(sizeof(PageEntry) % CACHE_LINE_SIZE == 0, "PageEntry size must be a multiple of cache line size");
 
 /*
  * A PageHandler adds reference count by 1 to a page in HnswPageCache
@@ -224,9 +232,9 @@ private:
 
     void load_from_disk_async(PageEntry *entry);
 
-    TAILQ_HEAD(LRUList, PageEntry);
-
 private:
+    static constexpr int K = 3;  // LRU-K
+
     std::string location;
 
     std::unique_ptr<char[]> page_data_pool;
@@ -238,8 +246,10 @@ private:
     size_t page_count;
     std::vector<PageEntry*> avail_page_entries;
 
-    LRUList lru_list; // list of evictable page entries (ref_count == 0)
-    std::unordered_map<page_id_t, PageEntry*> id_to_page; // map page_id to lru_list or using entry iterator
+    // lists of evictable page entries (ref_count == 0)
+    ListHead buffer_list;
+    ListHead history_list;
+    std::unordered_map<page_id_t, PageEntry*> id_to_page; // map page_id to list or using entry iterator
 
     std::condition_variable evict_cv; // for evicting thread to wait for evictable page entry
     std::mutex lru_mutex;

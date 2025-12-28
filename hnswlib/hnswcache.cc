@@ -57,7 +57,8 @@ HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size
         avail_page_entries.push_back(&page_entries[i]);
     }
 
-    TAILQ_INIT(&lru_list);
+    TAILQ_INIT(&history_list);
+    TAILQ_INIT(&buffer_list);
 
     // Open file once and keep it cached
     fd = ::open(location.c_str(), O_RDONLY);
@@ -81,6 +82,7 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         // Page exists in cache
         ++cache_hits;
         PageEntry* entry = it->second;
+        ++entry->access_count;
         add_page_ref(entry);
         lock.unlock();
 
@@ -98,12 +100,10 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         entry = avail_page_entries.back();
         avail_page_entries.pop_back();
     } else {
-        // No available entries, try to evict one from LRU list
-        if (!TAILQ_EMPTY(&lru_list)) {
-            entry = evict_one_for_use();
-        } else {
+        // No available entries, try to evict one
+        if ((entry = evict_one_for_use()) == nullptr) {
             // No evictable entries, wait until one becomes available
-            evict_cv.wait(lock, [this] { return !TAILQ_EMPTY(&lru_list); });
+            evict_cv.wait(lock, [this] { return !TAILQ_EMPTY(&history_list) || !TAILQ_EMPTY(&buffer_list); });
             // After waking up, evict from LRU list (guaranteed to be non-empty)
             entry = evict_one_for_use();
         }
@@ -116,6 +116,7 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         // don't need to lock entry->mtx here since no other thread can access this entry yet
         entry->state = PageEntry::State::Loading;
         id_to_page[page_id] = entry;
+        ++entry->access_count;
         add_page_ref(entry);
 
         // Load page from disk without holding the lru lock
@@ -136,6 +137,7 @@ std::optional<ReadAheadPageHandler> HnswPageCache::readahead_page(page_id_t page
     auto it = id_to_page.find(page_id);
     if (it != id_to_page.end()) {
         PageEntry* entry = it->second;
+        ++entry->access_count;
         add_page_ref(entry);
         return ReadAheadPageHandler(this, entry);
     }
@@ -149,9 +151,7 @@ std::optional<ReadAheadPageHandler> HnswPageCache::readahead_page(page_id_t page
         avail_page_entries.pop_back();
     } else {
         // No available entries, try to evict one from LRU list
-        if (!TAILQ_EMPTY(&lru_list)) {
-            entry = evict_one_for_use();
-        } else {
+        if ((entry = evict_one_for_use()) == nullptr) {
             // No evictable entries, cannot readahead now
             return std::nullopt;
         }
@@ -164,6 +164,7 @@ std::optional<ReadAheadPageHandler> HnswPageCache::readahead_page(page_id_t page
         // don't need to lock entry->mtx here since no other thread can access this entry yet
         entry->state = PageEntry::State::Loading;
         id_to_page[page_id] = entry;
+        ++entry->access_count;
         add_page_ref(entry);  // for readahead handler
         add_page_ref(entry);  // for readahead thread, when Loading, entry cannot be evicted
 
@@ -183,6 +184,7 @@ void HnswPageCache::readahead_page_async(page_id_t page_id) {
     // Check if the page is already in cache
     auto it = id_to_page.find(page_id);
     if (it != id_to_page.end()) {
+        ++it->second->access_count;
         return;
     }
 
@@ -195,9 +197,7 @@ void HnswPageCache::readahead_page_async(page_id_t page_id) {
         avail_page_entries.pop_back();
     } else {
         // No available entries, try to evict one from LRU list
-        if (!TAILQ_EMPTY(&lru_list)) {
-            entry = evict_one_for_use();
-        } else {
+        if ((entry = evict_one_for_use()) == nullptr) {
             // No evictable entries, cannot readahead now
             return;
         }
@@ -210,6 +210,7 @@ void HnswPageCache::readahead_page_async(page_id_t page_id) {
         // don't need to lock entry->mtx here since no other thread can access this entry yet
         entry->state = PageEntry::State::Loading;
         id_to_page[page_id] = entry;
+        ++entry->access_count;
         add_page_ref(entry);  // for readahead thread, when Loading, entry cannot be evicted
 
         // Load page from disk without holding the lru lock
@@ -247,10 +248,10 @@ void HnswPageCache::sub_page_ref(PageEntry *entry) {
 void HnswPageCache::pin(PageEntry *entry) {
     assert(entry->ref_count > 0);
     // std::cout << "Pinning page " << entry->page_id << std::endl;
-    if (entry->in_lru_list) {
+    if (entry->list_head) {
         // std::cout << "Removing Page " << entry->page_id << " from LRU list" << std::endl;
-        TAILQ_REMOVE(&lru_list, entry, entry);
-        entry->in_lru_list = false;
+        TAILQ_REMOVE(entry->list_head, entry, entry);
+        entry->list_head = nullptr;
     }
 }
 
@@ -258,22 +259,39 @@ void HnswPageCache::pin(PageEntry *entry) {
 void HnswPageCache::unpin(PageEntry *entry) {
     // std::cout << "Unpinning page " << entry->page_id << std::endl;
     assert(entry->ref_count == 0);
-    if (!entry->in_lru_list) {
-        TAILQ_INSERT_HEAD(&lru_list, entry, entry);
-        entry->in_lru_list = true;
+    if (!entry->list_head) {
+        if (entry->access_count < K) {
+            TAILQ_INSERT_HEAD(&history_list, entry, entry);
+            entry->list_head = &history_list;
+        } else {
+            TAILQ_INSERT_HEAD(&buffer_list, entry, entry);
+            entry->list_head = &buffer_list;
+        }
     }
 
     // Notify evict_cv that an evictable entry is available
     evict_cv.notify_one();
 }
 
-// caller should hold lru_mutex and ensure lru_list is not empty
+// caller should hold lru_mutex
 PageEntry* HnswPageCache::evict_one_for_use() {
-    PageEntry* entry = TAILQ_LAST((&lru_list), LRUList);
-    TAILQ_REMOVE(&lru_list, entry, entry);
-    id_to_page.erase(entry->page_id);
-    entry->release();
-    return entry;
+    if (!TAILQ_EMPTY(&history_list)) {
+        PageEntry* entry = TAILQ_LAST((&history_list), ListHead);
+        TAILQ_REMOVE(&history_list, entry, entry);
+        id_to_page.erase(entry->page_id);
+        entry->release();
+        return entry;
+    }
+
+    if (!TAILQ_EMPTY(&buffer_list)) {
+        PageEntry* entry = TAILQ_LAST((&buffer_list), ListHead);
+        TAILQ_REMOVE(&buffer_list, entry, entry);
+        id_to_page.erase(entry->page_id);
+        entry->release();
+        return entry;
+    }
+
+    return nullptr;
 }
 
 void HnswPageCache::load_from_disk(PageEntry *entry) {

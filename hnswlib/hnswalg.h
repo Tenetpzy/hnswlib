@@ -577,7 +577,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     metric_distance_computations+=size;
                 }
 
-    // TODO: Replace SSE to page cache readahead
     #ifdef USE_SSE
                 // _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
                 _mm_prefetch((char *) (visited_array + *data), _MM_HINT_T0);
