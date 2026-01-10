@@ -30,9 +30,7 @@ else:
     # Add all .cc files from hnswlib directory
     import glob
     source_files.extend(glob.glob('./hnswlib/*.cc'))
-
-
-libraries = []
+libraries = ['uring']
 extra_objects = []
 
 
@@ -68,7 +66,9 @@ def cpp_flag(compiler):
     """Return the -std=c++[17/14/11] compiler flag.
     The c++17 is prefered over c++14 and c++11 (when it is available).
     """
-    if has_flag(compiler, '-std=c++17'):
+    if has_flag(compiler, '-std=c++20'):
+        return '-std=c++20'
+    elif has_flag(compiler, '-std=c++17'):
         return '-std=c++17'
     elif has_flag(compiler, '-std=c++14'):
         return '-std=c++14'

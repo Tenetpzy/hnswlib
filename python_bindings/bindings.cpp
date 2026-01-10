@@ -176,7 +176,7 @@ class Index {
         appr_alg = NULL;
         ep_added = true;
         index_inited = false;
-        num_threads_default = std::thread::hardware_concurrency();
+        num_threads_default = 6;
 
         default_ef = 10;
     }
@@ -635,8 +635,11 @@ class Index {
 
             // avoid using threads when the number of searches is small:
             if (rows <= num_threads * 4) {
+                std::cout << "Disabling multithreading for small number of queries: rows = " << rows << ", num_threads = " << num_threads << std::endl;
                 num_threads = 1;
             }
+
+            std::cout << "rows = " << rows << ", num_threads = " << num_threads << std::endl;
 
             data_numpy_l = new hnswlib::labeltype[rows * k];
             data_numpy_d = new dist_t[rows * k];
