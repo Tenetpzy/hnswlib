@@ -399,8 +399,8 @@ struct CollectAllAwaiter {
             std::unique_ptr<LazyLocalBase> local;
             local = std::make_unique<LazyLocalBase>(_signal.get());
             _input[i]._coro.promise()._lazy_local = local.get();
-            auto&& func = [this, i, local = std::move(local)]() mutable {
-                _input[i].start([this, i, local = std::move(local)](
+            auto&& func = [this, executor, i, local = std::move(local)]() mutable {
+                _input[i].start([this, executor, i, local = std::move(local)](
                                     Try<ValueType>&& result) {
                     _output[i] = std::move(result);
                     std::size_t oldCount;
@@ -412,7 +412,7 @@ struct CollectAllAwaiter {
                         signal->emits(signalType);
                     }
                     if (awaitingCoro) {
-                        awaitingCoro.resume();
+                        executor->schedule(awaitingCoro);
                     }
                 });
             };
@@ -585,7 +585,7 @@ struct CollectAllVariadicAwaiter {
                             signal->emits(signalType);
                         }
                         if (awaitingCoro) {
-                            awaitingCoro.resume();
+                            executor->schedule(awaitingCoro);
                         }
                     });
                 };

@@ -20,7 +20,6 @@
 #ifndef ASYNC_SIMPLE_USE_MODULES
 
 #include <cstddef>
-#include <system_error>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -90,6 +89,22 @@ struct CollectAnyVariadicPairAwaiter;
 
 namespace detail {
 
+template <typename T>
+class RescheduleLazy;
+
+template <typename T>
+constexpr bool is_cross_executor_awaiter = false;
+
+template <typename T>
+constexpr bool is_cross_executor_awaiter<RescheduleLazy<T>> = true;
+
+template <typename T>
+concept IsCrossExecutorAwaiter = is_cross_executor_awaiter<std::remove_cvref_t<T>>;
+
+}  // namespace detail
+
+namespace detail {
+
 class LazyPromiseBase : public PromiseAllocator<void, true> {
 public:
     // Resume the caller waiting to the current coroutine. Note that we need
@@ -147,7 +162,9 @@ public:
     FinalAwaiter final_suspend() noexcept { return {}; }
 
     template <typename Awaitable>
-    decltype(auto) await_transform(Awaitable&& awaitable) {
+    decltype(auto) await_transform(Awaitable&& awaitable) 
+    // 对于IsCrossExecutorAwaiter类型，不需要传递executor
+    requires(!IsCrossExecutorAwaiter<Awaitable>) {
         // See CoAwait.h for details.
         return detail::coAwait(_executor, std::forward<Awaitable>(awaitable));
     }
@@ -300,6 +317,11 @@ struct LazyAwaiterBase {
 
     bool await_ready() const noexcept { return false; }
 
+    // note: co_await Lazy时，创建的awaiter对象拿走了Lazy的coro handle的所有权
+    // 在awaiter中销毁handle能够在co_await语句结束就释放Lazy协程的资源
+    // 给Lazy的使用者提供更大灵活性：
+    // auto t1 = task1();
+    // auto res = co_await t1; // t1的协程资源在这里就被释放了，如果不在awaiter中销毁，则task1的资源要等到t1作用域结束
     auto awaitResume() {
         if constexpr (std::is_void_v<T>) {
             _handle.promise().result();
@@ -360,6 +382,7 @@ public:
 
     private:
         auto awaitSuspendImpl() noexcept(!reschedule) {
+            // 对于RescheduleLazy，需要通过executor调度执行
             if constexpr (reschedule) {
                 // executor schedule performed
                 auto& pr = this->_handle.promise();
@@ -685,19 +708,19 @@ class [[nodiscard]] RescheduleLazy
     using Base = detail::LazyBase<T, true>;
 
 public:
-    void detach() {
-        this->start([](auto&& t) {
-            if (t.hasError()) {
-                std::rethrow_exception(t.getException());
-            }
-        });
-    }
+    // void detach() {
+    //     this->start([](auto&& t) {
+    //         if (t.hasError()) {
+    //             std::rethrow_exception(t.getException());
+    //         }
+    //     });
+    // }
 
-    [[deprecated(
-        "RescheduleLazy should be only allowed in DetachedCoroutine")]] auto
-    operator co_await() {
-        return Base::operator co_await();
-    }
+    // [[deprecated(
+    //     "RescheduleLazy should be only allowed in DetachedCoroutine")]] auto
+    // operator co_await() {
+    //     return Base::operator co_await();
+    // }
 
 private:
     using Base::Base;
