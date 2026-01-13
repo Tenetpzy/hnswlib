@@ -153,3 +153,61 @@ private:
         return value;
     }
 };
+
+template <typename T>
+class MpscQueue {
+private:
+    struct Node {
+        T data;
+        std::atomic<Node*> next{nullptr};
+        template<typename... Args>
+        Node(Args&&... args) : data(std::forward<Args>(args)...) {}
+        Node() {}
+    };
+
+#ifdef __cpp_lib_hardware_interference_size
+    static constexpr size_t cache_line_size = std::hardware_destructive_interference_size;
+#else
+    static constexpr size_t cache_line_size = 64;
+#endif
+
+    alignas(cache_line_size) std::atomic<Node*> head;
+    alignas(cache_line_size) Node* tail;
+
+public:
+    MpscQueue() {
+        Node* dummy = new Node();
+        head.store(dummy, std::memory_order_relaxed);
+        tail = dummy;
+    }
+
+    ~MpscQueue() {
+        while (tail) {
+            Node* next_node = tail->next.load(std::memory_order_relaxed);
+            delete tail;
+            tail = next_node;
+        }
+    }
+
+    template <typename... Args>
+    void enqueue(Args&&... args) {
+        Node* new_node = new Node(std::forward<Args>(args)...);
+        Node* prev_head = head.exchange(new_node, std::memory_order_acq_rel);
+        prev_head->next.store(new_node, std::memory_order_release);
+    }
+
+    std::optional<T> try_dequeue() {
+        Node* next_node = tail->next.load(std::memory_order_acquire);
+        if (next_node) {
+            T value = std::move(next_node->data);
+            delete tail;
+            tail = next_node;
+            return value;
+        }
+        return std::nullopt;
+    }
+
+    bool empty() const {
+        return tail->next.load(std::memory_order_acquire) == nullptr;
+    }
+};
