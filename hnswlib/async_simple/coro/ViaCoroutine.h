@@ -178,6 +178,7 @@ inline decltype(auto) coAwait(Executor* ex, Awaitable&& awaitable) {
         return detail::getAwaiter(
             std::forward<Awaitable>(awaitable).coAwait(ex));
     } else {
+        // 如果是自定义的awaitable或者RescheduledLazy，也是通过ViaAsyncAwaiter来处理
         using AwaiterType =
             decltype(detail::getAwaiter(std::forward<Awaitable>(awaitable)));
         return ViaAsyncAwaiter<std::decay_t<AwaiterType>>(

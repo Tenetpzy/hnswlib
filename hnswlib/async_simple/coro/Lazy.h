@@ -89,22 +89,6 @@ struct CollectAnyVariadicPairAwaiter;
 
 namespace detail {
 
-template <typename T>
-class RescheduleLazy;
-
-template <typename T>
-constexpr bool is_cross_executor_awaiter = false;
-
-template <typename T>
-constexpr bool is_cross_executor_awaiter<RescheduleLazy<T>> = true;
-
-template <typename T>
-concept IsCrossExecutorAwaiter = is_cross_executor_awaiter<std::remove_cvref_t<T>>;
-
-}  // namespace detail
-
-namespace detail {
-
 class LazyPromiseBase : public PromiseAllocator<void, true> {
 public:
     // Resume the caller waiting to the current coroutine. Note that we need
@@ -162,9 +146,7 @@ public:
     FinalAwaiter final_suspend() noexcept { return {}; }
 
     template <typename Awaitable>
-    decltype(auto) await_transform(Awaitable&& awaitable) 
-    // 对于IsCrossExecutorAwaiter类型，不需要传递executor
-    requires(!IsCrossExecutorAwaiter<Awaitable>) {
+    decltype(auto) await_transform(Awaitable&& awaitable) {
         // See CoAwait.h for details.
         return detail::coAwait(_executor, std::forward<Awaitable>(awaitable));
     }

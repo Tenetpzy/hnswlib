@@ -1,16 +1,16 @@
 #pragma once
 
+#include <coroutine>
 #include <cstdint>
-#include <optional>
+#include <deque>
 #include <sys/queue.h>
-#include <atomic>
-#include <condition_variable>
 #include <cstddef>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "iobackend.h"
+
+#include "async_simple/Executor.h"
+#include "async_simple/coro/Lazy.h"
 
 namespace hnswlib {
 
@@ -20,6 +20,8 @@ typedef unsigned int page_id_t;
 class HnswPageCache;
 TAILQ_HEAD(ListHead, PageEntry);
 
+using async_simple::coro::Lazy;
+
 class PageEntry {
     enum class State {
         InCache,
@@ -28,15 +30,14 @@ class PageEntry {
         NotInCache
     };
 
-    alignas(64) std::atomic_uint32_t ref_count;
-    alignas(64) std::atomic<State> state;
-
-    alignas(64)
+    uint32_t ref_count;
+    State state;
     char *data;
     ListHead *list_head;  // which list the entry is in, nullptr if using
     uint32_t access_count;  // for LRU-K
     page_id_t page_id;
     TAILQ_ENTRY(PageEntry) entry;
+    std::vector<std::coroutine_handle<>> waiters;
 
     PageEntry(): ref_count(0), state(State::NotInCache), data(nullptr), list_head(nullptr), access_count(0) {}
 
@@ -47,33 +48,30 @@ class PageEntry {
         access_count = 0;
     }
 
-    void wait_until_ready() {
-        // state only has Loading -> LoadingHasWaiter -> InCache tranfer
-        auto state_val = state.load(std::memory_order_acquire);
-        if (state_val == State::InCache) {
-            return;
-        } else if (state_val == State::Loading) {
-            if (state.compare_exchange_strong(state_val, State::LoadingHasWaiter, std::memory_order_seq_cst)) {
-                // changed state Loading -> LoadingHasWaiter
-                state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
-            } else if (state_val == State::LoadingHasWaiter) {
-                // other thread changed state Loading -> LoadingHasWaiter
-                state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
-            } 
-            // else if state_val == InCache, just return
-        } else {  // state_val == LoadingHasWaiter
-            state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
-        }
-    }
+    // void wait_until_ready() {
+    //     state only has Loading -> LoadingHasWaiter -> InCache tranfer
+    //     auto state_val = state.load(std::memory_order_acquire);
+    //     if (state_val == State::InCache) {
+    //         return;
+    //     } else if (state_val == State::Loading) {
+    //         if (state.compare_exchange_strong(state_val, State::LoadingHasWaiter, std::memory_order_seq_cst)) {
+    //             // changed state Loading -> LoadingHasWaiter
+    //             state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+    //         } else if (state_val == State::LoadingHasWaiter) {
+    //             // other thread changed state Loading -> LoadingHasWaiter
+    //             state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+    //         } 
+    //         // else if state_val == InCache, just return
+    //     } else {  // state_val == LoadingHasWaiter
+    //         state.wait(State::LoadingHasWaiter, std::memory_order_acquire);
+    //     }
+    // }
 
     friend class HnswPageCache;
     friend class PageHandler;
     friend class ReadAheadPageHandler;
-
-    static_assert(std::atomic<State>::is_always_lock_free, "State atomic is not lock free");
+    friend class PageLoadingAwaiter;
 };
-
-static_assert(sizeof(PageEntry) % CACHE_LINE_SIZE == 0, "PageEntry size must be a multiple of cache line size");
 
 /*
  * A PageHandler adds reference count by 1 to a page in HnswPageCache
@@ -115,38 +113,38 @@ private:
  * The return handler of readahead_page
  * Caller can wait for page ready through this handler
  */
-class ReadAheadPageHandler {
-public:
-    // Should call sub_page_ref of HnswPageCache to decrease the reference count
-    ~ReadAheadPageHandler();
+// class ReadAheadPageHandler {
+// public:
+//     // Should call sub_page_ref of HnswPageCache to decrease the reference count
+//     ~ReadAheadPageHandler();
 
-    ReadAheadPageHandler(const ReadAheadPageHandler&) = delete;
-    ReadAheadPageHandler& operator=(const ReadAheadPageHandler&) = delete;
-    ReadAheadPageHandler(ReadAheadPageHandler&& other) noexcept: cache(other.cache), entry(other.entry) {
-        other.cache = nullptr;
-        other.entry = nullptr;
-    }
-    ReadAheadPageHandler& operator=(ReadAheadPageHandler&& other) noexcept;
+//     ReadAheadPageHandler(const ReadAheadPageHandler&) = delete;
+//     ReadAheadPageHandler& operator=(const ReadAheadPageHandler&) = delete;
+//     ReadAheadPageHandler(ReadAheadPageHandler&& other) noexcept: cache(other.cache), entry(other.entry) {
+//         other.cache = nullptr;
+//         other.entry = nullptr;
+//     }
+//     ReadAheadPageHandler& operator=(ReadAheadPageHandler&& other) noexcept;
 
-    // Wait until the page is ready in cache
-    PageHandler wait_ready() && {
-        if (entry) {
-            entry->wait_until_ready();
-        }
-        auto ret = PageHandler(cache, entry);
-        cache = nullptr;
-        entry = nullptr;
-        return ret;
-    }
+//     // Wait until the page is ready in cache
+//     PageHandler wait_ready() && {
+//         if (entry) {
+//             entry->wait_until_ready();
+//         }
+//         auto ret = PageHandler(cache, entry);
+//         cache = nullptr;
+//         entry = nullptr;
+//         return ret;
+//     }
 
-private:
-    ReadAheadPageHandler(HnswPageCache *cache, PageEntry *entry): cache(cache), entry(entry) {}
+// private:
+//     ReadAheadPageHandler(HnswPageCache *cache, PageEntry *entry): cache(cache), entry(entry) {}
 
-    HnswPageCache *cache;
-    PageEntry *entry;
+//     HnswPageCache *cache;
+//     PageEntry *entry;
 
-    friend class HnswPageCache;
-};
+//     friend class HnswPageCache;
+// };
 
 /*
  * HnswPageCache manages the pages of HNSW index file on disk
@@ -172,7 +170,7 @@ public:
      * 
      * If the page is in cache and ready, just increase the page's refcount by 1
      */
-    PageHandler get_page(page_id_t page_id);
+    Lazy<PageHandler> get_page(page_id_t page_id);
 
     /*
      * Async prefetch the page into cache, should not block caller
@@ -182,8 +180,8 @@ public:
      * ReadAheadPageHandler holds an reference count of page
      * Caller can wait on the ReadAheadPageHandler until page ready
      */
-    std::optional<ReadAheadPageHandler> readahead_page(page_id_t page_id);
-    void readahead_page_async(page_id_t page_id);
+    // std::optional<ReadAheadPageHandler> readahead_page(page_id_t page_id);
+    // void readahead_page_async(page_id_t page_id);
 
     size_t get_avail_page_count() const {
         return avail_page_entries.size();
@@ -226,9 +224,9 @@ private:
 
     void unpin(PageEntry *entry);
 
-    PageEntry* evict_one_for_use();
+    Lazy<PageEntry*> evict_one_for_use();
 
-    void load_from_disk(PageEntry *entry);
+    Lazy<void> load_from_disk(PageEntry *entry);
 
     void load_from_disk_async(PageEntry *entry);
 
@@ -250,18 +248,27 @@ private:
     ListHead buffer_list;
     ListHead history_list;
     std::unordered_map<page_id_t, PageEntry*> id_to_page; // map page_id to list or using entry iterator
-
-    std::condition_variable evict_cv; // for evicting thread to wait for evictable page entry
-    std::mutex lru_mutex;
-
-    IOBackend io_backend;
+    std::deque<std::coroutine_handle<>> evict_waiters;
 
     size_t cache_hits{0}, cache_miss{0};
-    std::atomic_size_t io_op_num{0};
-    std::atomic_size_t memory_transfer_bytes{0};
+    size_t io_op_num{0};
+    size_t memory_transfer_bytes{0};
 
     friend class PageHandler;
     friend class ReadAheadPageHandler;
+    friend class EvictAwaiter;
+};
+
+class HnswPageCacheDispatcher {
+public:
+    HnswPageCacheDispatcher(std::vector<async_simple::Executor*> executors, 
+        const std::string &location, size_t page_size, size_t cache_size);
+    
+    Lazy<PageHandler> get_page(page_id_t page_id);
+
+
+private:
+    
 };
 
 } // namespace hnswlib

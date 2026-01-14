@@ -39,7 +39,7 @@ using UringCallback = std::function<void(int)>;
 
 class UringExecutor;
 
-class Context {
+class UringContext {
 public:
     static UringExecutor& current_executor() {
         return *current_executor_ptr;
@@ -70,7 +70,6 @@ public:
         close(ev_fd);
     }
 
-    // 启动调度器线程
     void start() {
         running = true;
         worker_thread = std::thread([this]() {
@@ -78,7 +77,7 @@ public:
             CPU_ZERO(&cpuset);
             CPU_SET(this->cpu_id, &cpuset);
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-            HnswExecutor::Context::set_current_executor(*this);
+            HnswExecutor::UringContext::set_current_executor(*this);
             this->run_loop();
         });
     }
@@ -95,7 +94,18 @@ public:
     }
 
     virtual bool currentThreadInExecutor() const override {
-        return &HnswExecutor::Context::current_executor() == this;
+        return &HnswExecutor::UringContext::current_executor() == this;
+    }
+
+    // async_simple框架依赖checkin和checkout做协程在特定上下文上的调度
+    // 通过ViaCoroutine，自定义的awaiter中，拿到协程句柄，恢复时直接调它的resume，ViaCoroutine帮助协程在原上下文恢复执行
+    // 我认为这是不好的设计，不应该把coroutine_handle暴露给协程的使用者，应该类似Rust，由Executor提供一个Waker对象用于唤醒
+    // 不想改框架了，只能实现checkin和checkout
+    virtual bool checkin(Func func, Context ctx, [[maybe_unused]] async_simple::ScheduleOptions opts) override {
+        return reinterpret_cast<UringExecutor*>(ctx)->schedule(std::move(func));
+    }
+    virtual Context checkout() override {
+        return this;
     }
 
     // 提交一个IO操作，返回值是res
@@ -119,8 +129,8 @@ public:
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&sched->ring);
                 io_uring_prep_read(sqe, fd, buf, len, off);
                 io_uring_sqe_set_data(sqe, callback.target<UringCallback>());
-
                 io_uring_submit(&sched->ring);
+                sched->incompleted_io_count++;
             }
             int await_resume() { return res; }
         };
@@ -196,8 +206,12 @@ private:
                 incompleted_io_count -= count;
             }
 
-            // 3. 休眠决策
+            // 3. 休眠/退出
             if (!did_work) {
+                if (incompleted_io_count == 0 && !running) {
+                    break;
+                }
+
                 is_sleeping.store(true, std::memory_order_seq_cst);
 
                 if (!task_queue.empty()) {
