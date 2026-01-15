@@ -142,9 +142,9 @@ struct [[nodiscard]] ViaAsyncAwaiter {
                 _viaCoroutine.getWrappedContinuation(continuation));
             // TODO: if should_suspend is false, checkout/checkin should not be
             // called.
-            if (should_suspend == false) {
-                _viaCoroutine.checkin();
-            }
+            // if (should_suspend == false) {
+            //     _viaCoroutine.checkin();
+            // }
             return should_suspend;
         } else {
             return _awaiter.await_suspend(

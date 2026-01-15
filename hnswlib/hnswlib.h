@@ -1,5 +1,7 @@
 #pragma once
 
+#include "async_simple/coro/Lazy.h"
+
 // https://github.com/nmslib/hnswlib/pull/508
 // This allows others to provide their own error stream (e.g. RcppHNSW)
 #ifndef HNSWLIB_ERR_OVERRIDE
@@ -122,6 +124,9 @@ static bool AVX512Capable() {
 #include <string.h>
 
 namespace hnswlib {
+
+using async_simple::coro::Lazy;
+
 typedef size_t labeltype;
 
 // This can be extended to store state for filtering (e.g. from a std::set)
@@ -188,11 +193,11 @@ class AlgorithmInterface {
  public:
     virtual void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) = 0;
 
-    virtual std::priority_queue<std::pair<dist_t, labeltype>>
+    virtual Lazy<std::priority_queue<std::pair<dist_t, labeltype>>>
         searchKnn(const void*, size_t, BaseFilterFunctor* isIdAllowed = nullptr) const = 0;
 
     // Return k nearest neighbor in the order of closer fist
-    virtual std::vector<std::pair<dist_t, labeltype>>
+    virtual Lazy<std::vector<std::pair<dist_t, labeltype>>>
         searchKnnCloserFirst(const void* query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const;
 
     virtual void saveIndex(const std::string &location) = 0;
@@ -201,13 +206,13 @@ class AlgorithmInterface {
 };
 
 template<typename dist_t>
-std::vector<std::pair<dist_t, labeltype>>
+Lazy<std::vector<std::pair<dist_t, labeltype>>>
 AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void* query_data, size_t k,
                                                  BaseFilterFunctor* isIdAllowed) const {
     std::vector<std::pair<dist_t, labeltype>> result;
 
     // here searchKnn returns the result in the order of further first
-    auto ret = searchKnn(query_data, k, isIdAllowed);
+    auto ret = co_await searchKnn(query_data, k, isIdAllowed);
     {
         size_t sz = ret.size();
         result.resize(sz);
@@ -217,7 +222,7 @@ AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void* query_data, size_t 
         }
     }
 
-    return result;
+    co_return result;
 }
 }  // namespace hnswlib
 

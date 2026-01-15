@@ -9,8 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "async_simple/Executor.h"
 #include "async_simple/coro/Lazy.h"
+#include "executor.h"
 
 namespace hnswlib {
 
@@ -18,6 +18,7 @@ static constexpr size_t CACHE_LINE_SIZE = 64;
 
 typedef unsigned int page_id_t;
 class HnswPageCache;
+class HnswPageCacheDispatcher;
 TAILQ_HEAD(ListHead, PageEntry);
 
 using async_simple::coro::Lazy;
@@ -71,6 +72,7 @@ class PageEntry {
     friend class PageHandler;
     friend class ReadAheadPageHandler;
     friend class PageLoadingAwaiter;
+    friend class HnswPageCacheDispatcher;
 };
 
 /*
@@ -100,9 +102,9 @@ public:
 private:
     // Once PageHandler is created, it increases the reference count of the page in cache
     // Note for the race condition of evict and reference increase when you implement HnswPageCache
-    PageHandler(HnswPageCache *cache, PageEntry *entry): cache(cache), entry(entry) {}
+    PageHandler(HnswPageCacheDispatcher *cache, PageEntry *entry): cache(cache), entry(entry) {}
 
-    HnswPageCache *cache;
+    HnswPageCacheDispatcher *cache;
     PageEntry *entry;
 
     friend class HnswPageCache;
@@ -156,7 +158,7 @@ public:
      * page_size: size in byte of each page
      * cache_size: total available byte for cache
      */
-    HnswPageCache(const std::string &location, size_t page_size, size_t cache_size);
+    HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher);
     ~HnswPageCache();
 
     /*
@@ -233,6 +235,8 @@ private:
 private:
     static constexpr int K = 3;  // LRU-K
 
+    HnswPageCacheDispatcher *dispatcher;
+
     std::string location;
 
     std::unique_ptr<char[]> page_data_pool;
@@ -254,21 +258,92 @@ private:
     size_t io_op_num{0};
     size_t memory_transfer_bytes{0};
 
-    friend class PageHandler;
     friend class ReadAheadPageHandler;
     friend class EvictAwaiter;
+    friend class HnswPageCacheDispatcher;
 };
 
 class HnswPageCacheDispatcher {
 public:
-    HnswPageCacheDispatcher(std::vector<async_simple::Executor*> executors, 
-        const std::string &location, size_t page_size, size_t cache_size);
-    
-    Lazy<PageHandler> get_page(page_id_t page_id);
+    HnswPageCacheDispatcher(std::vector<HnswExecutor::UringExecutor*> &executors, 
+        const std::string &location, size_t page_size, size_t cache_size)
+        : executors(executors) {
+        size_t per_cache_size = cache_size / executors.size();
+        for (size_t i = 0; i < executors.size(); i++) {
+            caches.emplace_back(std::make_unique<HnswPageCache>(location, page_size, per_cache_size, this));
+        }
+    }
 
+    Lazy<PageHandler> get_page(page_id_t page_id) {
+        size_t idx = page_id % executors.size();
+        if (executors[idx]->currentThreadInExecutor()) {
+            co_return co_await caches[idx]->get_page(page_id);
+        } else {
+            // via返回rescheduledLazy，它始终会把当前协程挂起并在另一个executor启动
+            co_return co_await caches[idx]->get_page(page_id).via(executors[idx]);
+        }
+    }
+
+    const HnswExecutor::UringExecutor* run_on(page_id_t page_id) const {
+        size_t idx = page_id % executors.size();
+        return executors[idx];
+    }
+
+    float get_cache_hit_rate() const {
+        size_t total_hits = 0;
+        size_t total_requests = 0;
+        for (const auto &cache : caches) {
+            total_hits += cache->cache_hits;
+            total_requests += cache->cache_hits + cache->cache_miss;
+        }
+        if (total_requests == 0) return 0.0f;
+        return static_cast<float>(total_hits) / static_cast<float>(total_requests);
+    }
+
+    float get_memory_transfer_kb() const {
+        size_t total_bytes = 0;
+        for (const auto &cache : caches) {
+            total_bytes += cache->memory_transfer_bytes;
+        }
+        return static_cast<float>(total_bytes) / 1024.0f;
+    }
+
+    size_t get_io_op_num() const {
+        size_t total_io_op = 0;
+        for (const auto &cache : caches) {
+            total_io_op += cache->io_op_num;
+        }
+        return total_io_op;
+    }
+
+    void reset_metrics_counter() {
+        for (const auto &cache : caches) {
+            cache->reset_metrics_counter();
+        }
+    }
 
 private:
-    
+
+    Lazy<void> put_page_coro(PageEntry *entry, HnswPageCache *cache) {
+        cache->sub_page_ref(entry);
+        co_return;
+    }
+
+    void put_page(PageEntry *entry) {
+        size_t idx = entry->page_id % executors.size();
+        if (executors[idx]->currentThreadInExecutor()) {
+            caches[idx]->sub_page_ref(entry);
+        } else {
+            auto cache = caches[idx].get();
+            put_page_coro(entry, cache).via(executors[idx]).start();
+        }
+    }
+
+private:
+    std::vector<HnswExecutor::UringExecutor*> &executors;
+    std::vector<std::unique_ptr<HnswPageCache>> caches;
+
+    friend class PageHandler;
 };
 
 } // namespace hnswlib

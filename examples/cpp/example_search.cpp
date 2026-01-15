@@ -1,6 +1,12 @@
 #include "../../hnswlib/hnswlib.h"
-#include <unistd.h>
+#include "async_simple/coro/SyncAwait.h"
+#include "async_simple/coro/Lazy.h"
+#include "async_simple/coro/Collect.h"
 
+#include <unistd.h>
+#include <vector>
+
+using namespace async_simple::coro;
 
 int main() {
     int dim = 16;               // Dimension of the elements
@@ -8,6 +14,8 @@ int main() {
     int M = 16;                 // Tightly connected with internal dimensionality of the data
                                 // strongly affects the memory consumption
     int ef_construction = 200;  // Controls index search speed/build speed tradeoff
+    int cache_page_num = 48;
+    int search_beam_width = 2;
 
     // Initing index
     hnswlib::L2Space space(dim);
@@ -48,16 +56,28 @@ int main() {
     delete alg_hnsw;
 
     // Deserialize index and check recall
-    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, 98304);
+    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 16 * 1024, 4);
     float correct = 0;
+    auto executors = alg_hnsw->executors();
+    std::vector<RescheduleLazy<std::priority_queue<std::pair<float, unsigned long>>>> tasks;
     for (int i = 0; i < max_elements; i++) {
         if (i % 100 == 0) {
-            std::cout << "Searching for element " << i << "/" << max_elements << "\n";
+            // std::cout << "Searching for element " << i << "/" << max_elements << "\n";
+            // std::cout << "Queued tasks: " << tasks.size() << "\n";
         }
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + i * dim, 1);
-        hnswlib::labeltype label = result.top().second;
+        tasks.push_back(alg_hnsw->searchKnn(data + i * dim, 1).via(executors[i % executors.size()]));
+        // std::priority_queue<std::pair<float, hnswlib::labeltype>> result = async_simple::coro::syncAwait(alg_hnsw->searchKnn(data + i * dim, 1).via(alg_hnsw->executors()[0]));
+        // hnswlib::labeltype label = result.top().second;
+        // if (label == i) correct++;
+    }
+
+    int max_concurrency = cache_page_num / search_beam_width;
+    auto results = async_simple::coro::syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
+    for (int i = 0; i < max_elements; i++) {
+        hnswlib::labeltype label = results[i].value().top().second;
         if (label == i) correct++;
     }
+
     float recall = (float)correct / max_elements;
     std::cout << "Recall of deserialized index: " << recall << "\n";
     std::cout 

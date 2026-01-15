@@ -345,12 +345,12 @@ public:
         template <typename PromiseType>
         AS_INLINE auto await_suspend(std::coroutine_handle<PromiseType>
                                          continuation) noexcept(!reschedule) {
-            static_assert(
-                std::is_base_of<LazyPromiseBase, PromiseType>::value ||
-                    std::is_same_v<detail::DetachedCoroutine::promise_type,
-                                   PromiseType>,
-                "'co_await Lazy' is only allowed to be called by Lazy or "
-                "DetachedCoroutine");
+            // static_assert(
+            //     std::is_base_of<LazyPromiseBase, PromiseType>::value ||
+            //         std::is_same_v<detail::DetachedCoroutine::promise_type,
+            //                        PromiseType>,
+            //     "'co_await Lazy' is only allowed to be called by Lazy or "
+            //     "DetachedCoroutine");
             // current coro started, caller becomes my continuation
             this->_handle.promise()._continuation = continuation;
             if constexpr (std::is_base_of<LazyPromiseBase,
@@ -430,6 +430,18 @@ public:
         };
         [[maybe_unused]] auto detached =
             launchCoro(std::move(*this), std::forward<F>(callback));
+    }
+
+    void start() {
+        logicAssert(this->_coro.operator bool(),
+                    "Lazy do not have a coroutine_handle "
+                    "Maybe the allocation failed or you're using a used Lazy");
+
+        // a detached coroutine will not suspend at initial/final suspend point.
+        auto launchCoro = [](LazyBase lazy) -> detail::DetachedCoroutine {
+            co_await lazy;
+        };
+        [[maybe_unused]] auto detached = launchCoro(std::move(*this));
     }
 
     bool isReady() const { return !_coro || _coro.done(); }

@@ -28,13 +28,13 @@ private:
 
 PageHandler::~PageHandler() {
     if (cache && entry)
-        cache->sub_page_ref(this->entry);
+        cache->put_page(entry);
 }
 
 PageHandler& PageHandler::operator=(PageHandler&& other) noexcept {
     if (this != &other) {
         if (cache && entry) {
-            cache->sub_page_ref(this->entry);
+            cache->put_page(this->entry);
         }
         cache = other.cache;
         entry = other.entry;
@@ -62,7 +62,8 @@ PageHandler& PageHandler::operator=(PageHandler&& other) noexcept {
 //     return *this;
 // }
 
-HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size) {
+HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher) {
+    this->dispatcher = dispatcher;
     this->location = location;
     this->page_size = page_size;
     size_t max_page_count = cache_size / page_size;
@@ -102,7 +103,7 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
         add_page_ref(entry);
 
         co_await PageLoadingAwaiter(entry);
-        co_return PageHandler(this, entry);
+        co_return PageHandler(dispatcher, entry);
     }
 
     // Page not in cache, need to load it
@@ -128,7 +129,7 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
         add_page_ref(entry);
 
         co_await load_from_disk(entry);
-        co_return PageHandler(this, entry);
+        co_return PageHandler(dispatcher, entry);
     }
 
     // Should not reach here
@@ -228,18 +229,18 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
 // }
 
 void HnswPageCache::add_page_ref(PageEntry *entry) {
-    auto ori = entry->ref_count++;
+    ++entry->ref_count;
     // If ref_count was 0, move from lru_list to using_entry
-    if (ori == 0) {
+    if (entry->ref_count == 1) {
         pin(entry);
     }
 }
 
 void HnswPageCache::sub_page_ref(PageEntry *entry) {
-    auto ori = entry->ref_count--;
+    --entry->ref_count;
     
     // If ref_count becomes 0, move from using_entry to lru_list
-    if (ori == 1) {
+    if (entry->ref_count == 0) {
         unpin(entry);
     }
 }
@@ -265,12 +266,11 @@ void HnswPageCache::unpin(PageEntry *entry) {
             TAILQ_INSERT_HEAD(&buffer_list, entry, entry);
             entry->list_head = &buffer_list;
         }
-    }
 
-    if (!evict_waiters.empty()) {
-        auto h = evict_waiters.front();
-        evict_waiters.pop_front();
-        h.resume();
+        for (auto h: evict_waiters) {
+            h.resume();
+        }
+        evict_waiters.clear();
     }
 }
 
@@ -285,7 +285,7 @@ public:
     void await_resume() {}
 
     bool await_ready() {
-        return !TAILQ_EMPTY(&cache->history_list) || !TAILQ_EMPTY(&cache->buffer_list);
+        return false;
     }
 
 private:
@@ -293,8 +293,12 @@ private:
 };
 
 Lazy<PageEntry*> HnswPageCache::evict_one_for_use() {
-    co_await EvictAwaiter(this);
+
+    while (TAILQ_EMPTY(&history_list) && TAILQ_EMPTY(&buffer_list))
+        co_await EvictAwaiter(this);
     
+    assert(!TAILQ_EMPTY(&history_list) || !TAILQ_EMPTY(&buffer_list));
+
     if (!TAILQ_EMPTY(&history_list)) {
         PageEntry* entry = TAILQ_LAST((&history_list), ListHead);
         TAILQ_REMOVE(&history_list, entry, entry);

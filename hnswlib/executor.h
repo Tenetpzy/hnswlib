@@ -4,6 +4,7 @@
 #include <functional>
 #include <liburing.h>
 #include <fcntl.h>
+#include <memory>
 #include <optional>
 #include <unistd.h>
 #include <sys/eventfd.h>
@@ -13,6 +14,7 @@
 #include <coroutine>
 #include <thread>
 #include <atomic>
+#include <x86intrin.h>
 #include <cassert>
 #include <cstring>
 #include "async_simple/Executor.h"
@@ -20,6 +22,42 @@
 #include "mpsc.h"
 
 namespace HnswExecutor {
+
+class TscClock {
+public:
+    static double get_ticks_per_ns() {
+        static const double ticks_per_ns = []() {
+            // 预热：先做一次短 sleep，让 CPU 脱离深度睡眠状态，恢复全速频率
+            // 防止从 C-State 唤醒过程影响校准
+            using namespace std::chrono;
+            std::this_thread::sleep_for(milliseconds(10));
+            auto start_time = steady_clock::now();
+            uint64_t start_tsc = __rdtsc();
+            std::this_thread::sleep_for(milliseconds(100));
+            uint64_t end_tsc = __rdtsc();
+            auto end_time = steady_clock::now();
+            auto duration_ns = duration_cast<nanoseconds>(end_time - start_time).count();
+            return static_cast<double>(end_tsc - start_tsc) / duration_ns;
+        }();
+        return ticks_per_ns;
+    }
+
+    static uint64_t ms_to_ticks(uint64_t ms) {
+        return static_cast<uint64_t>(ms * 1000000.0 * get_ticks_per_ns());
+    }
+    
+    static uint64_t us_to_ticks(uint64_t us) {
+        return static_cast<uint64_t>(us * 1000.0 * get_ticks_per_ns());
+    }
+
+    static inline uint64_t now() __attribute__((always_inline)) {
+        return __rdtsc();
+    }
+    
+    static inline void relax() __attribute__((always_inline)) {
+        _mm_pause(); 
+    }
+};
 
 // 用于 O_DIRECT 的对齐内存分配器
 struct AlignedBuffer {
@@ -53,12 +91,14 @@ private:
     static inline thread_local UringExecutor* current_executor_ptr = nullptr;
 };
 
+struct CqeHandler {
+    virtual void complete(int32_t res) = 0;
+    virtual ~CqeHandler() = default;
+};
+
 class UringExecutor: public Executor {
 public:
-    UringExecutor(int id) : cpu_id(id) {
-        setup_ring();
-        setup_eventfd();
-    }
+    UringExecutor(int id) : cpu_id(id) {}
 
     ~UringExecutor() {
         if (worker_thread.joinable()) {
@@ -70,6 +110,10 @@ public:
         close(ev_fd);
     }
 
+    int id() const {
+        return cpu_id;
+    }
+
     void start() {
         running = true;
         worker_thread = std::thread([this]() {
@@ -78,6 +122,8 @@ public:
             CPU_SET(this->cpu_id, &cpuset);
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
             HnswExecutor::UringContext::set_current_executor(*this);
+            setup_ring();
+            setup_eventfd();
             this->run_loop();
         });
     }
@@ -111,64 +157,94 @@ public:
     // 提交一个IO操作，返回值是res
     // 协程通过co_await this->async_read(fd, buf, len, offset)来等待
     auto async_read(int fd, void* buf, unsigned len, off_t offset) {
-        struct Awaiter {
+        struct ReadAwaiter : public CqeHandler {
             UringExecutor* sched;
-            int fd; void* buf; unsigned len; off_t off;
-            UringCallback callback;
-            int res = 0;
+            int fd; 
+            void* buf; 
+            unsigned len; 
+            off_t off;
+            int32_t result = 0;
+            std::coroutine_handle<> coro;
 
-            bool await_ready() { return false; }
+            ReadAwaiter(UringExecutor* s, int f, void* b, unsigned l, off_t o)
+                : sched(s), fd(f), buf(b), len(l), off(o) {}
+
+            bool await_ready() const { return false; }
+
             void await_suspend(std::coroutine_handle<> h) {
-                callback = [h, this](int io_res) {
-                    res = io_res;
-                    sched->schedule([h]() mutable {
-                        h.resume();
-                    });
-                };
-
-                struct io_uring_sqe* sqe = io_uring_get_sqe(&sched->ring);
+                coro = h;
+                struct io_uring_sqe* sqe = sched->get_sqe_safe();
                 io_uring_prep_read(sqe, fd, buf, len, off);
-                io_uring_sqe_set_data(sqe, callback.target<UringCallback>());
-                io_uring_submit(&sched->ring);
-                sched->incompleted_io_count++;
+                io_uring_sqe_set_data(sqe, static_cast<CqeHandler*>(this));
             }
-            int await_resume() { return res; }
+
+            int await_resume() { return result; }
+
+            void complete(int32_t res) override {
+                result = res;
+                coro.resume(); 
+            }
         };
-        return Awaiter{this, fd, buf, len, offset, {}, 0};
+
+        return ReadAwaiter{this, fd, buf, len, offset};
     }
 
     
 private:
 
+    struct io_uring_sqe* get_sqe_safe() {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            io_uring_submit(&ring);
+            sqe = io_uring_get_sqe(&ring);
+            if (!sqe) throw std::runtime_error("IoUring SQ Full"); 
+        }
+        return sqe;
+    }
+
     void setup_ring() {
         struct io_uring_params params;
         memset(&params, 0, sizeof(params));
+        
+        // 承诺只有一个线程提交请求，内核免锁
+        params.flags |= IORING_SETUP_SINGLE_ISSUER;
+        
+        // 推迟到iouring_enter内核再收割，避免中断后半部的work_queue影响用户态线程的cache
+        params.flags |= IORING_SETUP_DEFER_TASKRUN;
+        
         if (io_uring_queue_init_params(IOURING_ENTRIES, &ring, &params) < 0)
             throw std::runtime_error("Init ring failed");
     }
 
+    struct EventFdHandler : public CqeHandler {
+        UringExecutor* executor;
+        int fd;
+        uint64_t buf = 0;
+        struct iovec iov;
+
+        EventFdHandler(UringExecutor* ex, int f) : executor(ex), fd(f) {
+            iov.iov_base = &buf;
+            iov.iov_len = sizeof(buf);
+        }
+
+        void arm() {
+            struct io_uring_sqe* sqe = executor->get_sqe_safe();
+            io_uring_prep_readv(sqe, fd, &iov, 1, 0);
+            io_uring_sqe_set_data(sqe, static_cast<CqeHandler*>(this));
+        }
+
+        void complete(int32_t res) override {
+            (void)res;
+            arm();
+        }
+    };
+
     void setup_eventfd() {
-        ev_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (ev_fd < 0) throw std::runtime_error("Init eventfd failed");
-        arm_eventfd();
-    }
-
-    void arm_eventfd() {
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-
-        ev_iov.iov_base = &ev_buf;
-        ev_iov.iov_len = sizeof(ev_buf);
-
-        // 构建eventfd回调
-        ev_callback = [this](int) {
-            // 读取eventfd的值以清零
-            uint64_t val;
-            read(ev_fd, &val, sizeof(val));
-        };
-
-        io_uring_prep_readv(sqe, ev_fd, &ev_iov, 1, 0);
-        io_uring_sqe_set_data(sqe, &ev_callback);
-        io_uring_submit(&ring);
+        ev_fd = eventfd(0, 0);
+        if (ev_fd < 0) 
+            throw std::runtime_error("Init eventfd failed");
+        ev_handler = std::make_unique<EventFdHandler>(this, ev_fd);
+        ev_handler->arm(); 
     }
 
     void wakeup() {
@@ -177,41 +253,58 @@ private:
     }
 
     void run_loop() {
-        while (true) {
+        const uint64_t IDLE_TIMEOUT_TICKS = TscClock::ms_to_ticks(10);
+        uint64_t start_idle_tsc = 0;
+        bool is_spinning = false;
+
+        while (running) {
             bool did_work = false;
 
-            // 1. 处理新任务
+            // 处理新任务
             std::optional<Func> task;
-            while ((task = task_queue.try_dequeue()).has_value()) {
+            int task_limit = 64;
+            while (task_limit-- > 0 && (task = task_queue.try_dequeue()).has_value()) {
                 task.value()();
                 did_work = true;
             }
 
-            // 2. 处理IO完成事件
+            // 处理IO完成事件
             io_uring_cqe* cqe;
             unsigned head;
             unsigned count = 0;
 
             io_uring_for_each_cqe(&ring, head, cqe) {
-                void* data = io_uring_cqe_get_data(cqe);
-                auto* cb = reinterpret_cast<UringCallback*>(data);
-                if (cb) {
-                    cb->operator()(cqe->res);
-                }
                 count++;
+                auto* handler = reinterpret_cast<CqeHandler*>(io_uring_cqe_get_data(cqe));
+                if (handler) {
+                    handler->complete(cqe->res);
+                }
             }
             if (count > 0) {
                 io_uring_cq_advance(&ring, count);
                 did_work = true;
-                incompleted_io_count -= count;
             }
 
-            // 3. 休眠/退出
-            if (!did_work) {
-                if (incompleted_io_count == 0 && !running) {
-                    break;
+            if (did_work) {
+                io_uring_submit(&ring);
+                is_spinning = false;  // 如果干了活，重置自旋状态
+                continue;
+            }
+
+            if (!is_spinning) {
+                // 刚发现没事做，记录当前时间，开始计时
+                start_idle_tsc = TscClock::now();
+                is_spinning = true;
+            } else {
+                // 已经在自旋了，检查是否超时
+                uint64_t current_tsc = TscClock::now();
+                if (current_tsc - start_idle_tsc < IDLE_TIMEOUT_TICKS) {
+                    // 未超时：CPU降频空转
+                    TscClock::relax(); 
+                    continue; 
                 }
 
+                // 休眠
                 is_sleeping.store(true, std::memory_order_seq_cst);
 
                 if (!task_queue.empty()) {
@@ -219,7 +312,7 @@ private:
                     continue;
                 }
 
-                io_uring_enter(ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, NULL);
+                io_uring_submit_and_wait(&ring, 1);
             }
         }
     }
@@ -231,11 +324,7 @@ private:
     struct io_uring ring;
 
     int ev_fd;
-    uint64_t ev_buf = 0;
-    struct iovec ev_iov;
-    UringCallback ev_callback;
-
-    uint32_t incompleted_io_count = 0;
+    std::unique_ptr<EventFdHandler> ev_handler;
 
     std::thread worker_thread;
     MpscQueue<Func> task_queue;

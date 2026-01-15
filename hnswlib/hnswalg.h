@@ -12,10 +12,13 @@
 #include <unordered_set>
 #include <memory>
 #include <utility>
+#include "async_simple/coro/Lazy.h"
 
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+using async_simple::coro::Lazy;
 
 static const unsigned char DELETE_MARK = 0x01;
 template<typename dist_t>
@@ -144,8 +147,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
-    // Page cache and on-demand loading support
-    std::unique_ptr<HnswPageCache> page_cache;
+    std::unique_ptr<std::vector<HnswExecutor::UringExecutor*>> executors_ptr;
+    std::unique_ptr<HnswPageCacheDispatcher> page_cache;
     size_t page_size_{0};  // page size for on-demand loading
     size_t level0_elements_per_page_{0};  // number of elements per page in level 0
     page_id_t level0_first_page_id_{0};  // page id of the first element in level 0
@@ -158,11 +161,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         SpaceInterface<dist_t> *s,
         const std::string &location,
         size_t cache_size = 0,
+        size_t thread_num = 1,
         bool nmslib = false,
         size_t max_elements = 0,
         bool allow_replace_deleted = false)
         : allow_replace_deleted_(allow_replace_deleted) {
-        loadIndex(location, s, max_elements, cache_size);
+        loadIndex(location, s, max_elements, cache_size, thread_num);
     }
 
 
@@ -230,6 +234,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         clear();
     }
 
+    const std::vector<HnswExecutor::UringExecutor*>& executors() const {
+        return *executors_ptr;
+    }
+
     void clear() {
         if (data_level0_memory_ != nullptr) {
             free(data_level0_memory_);
@@ -270,14 +278,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     // return the link list offset of internal_id
-    std::pair<page_id_t, size_t> get_higher_level_offset(tableint internal_id, int level) const {
+    Lazy<std::pair<page_id_t, size_t>> get_higher_level_offset(tableint internal_id, int level) const {
         // Calculate page and offset for the link list
         size_t link_offset_entry_offset = internal_id * sizeof(size_t);
         size_t link_offset_entry_page_id = link_offset_array_page_id_ + link_offset_entry_offset / page_size_;
         size_t link_offset_entry_offset_in_page = link_offset_entry_offset % page_size_;
 
         // Load the page containing the link offset entry
-        auto link_array_page = page_cache->get_page(link_offset_entry_page_id);
+        auto link_array_page = co_await page_cache->get_page(link_offset_entry_page_id);
 
         // Get the offset of this element's link list
         size_t *link_offset_ptr = (size_t *)(link_array_page.get_ptr() + link_offset_entry_offset_in_page);
@@ -287,7 +295,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t page_id = link_offset / page_size_;
         size_t offset_in_page = link_offset % page_size_ + (level - 1) * size_links_per_element_;
 
-        return std::make_pair(page_id, offset_in_page);
+        co_return std::make_pair(page_id, offset_in_page);
     }
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
@@ -449,7 +457,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
     template <bool bare_bone_search = true, bool collect_metrics = false>
-    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    Lazy<std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>>
     searchBaseLayerST(
         tableint ep_id,
         const void *data_point,
@@ -462,52 +470,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
-        
-        // std::unordered_map<page_id_t, PageHandler> cur_level_node_pages;
-        // std::unordered_map<page_id_t, ReadAheadPageHandler> cur_level_node_readahead_pages;
-        // // assign to ⬆ when searching into next layer
-        // std::unordered_map<page_id_t, PageHandler> cur_level_neighbor_pages;
-        // std::unordered_map<page_id_t, ReadAheadPageHandler> cur_level_neighbor_readahead_pages;
-        // // assign to ⬆ when searching into next layer
-        // std::unordered_map<page_id_t, ReadAheadPageHandler> cand_node_neighbor_readahead_pages;  // dist(cand_neighbor, cur) == 2, clear when searching next layer
-
-        // auto get_page = [this](
-        //     std::unordered_map<page_id_t, PageHandler>& pages, 
-        //     std::unordered_map<page_id_t, ReadAheadPageHandler>& readahead_pages,
-        //     page_id_t page_id) -> PageHandler& {
-        //     if (pages.contains(page_id)) {
-        //         return pages.at(page_id);
-        //     }
-        //     else if (readahead_pages.contains(page_id)) {
-        //         auto readahead_handler = std::move(readahead_pages.at(page_id));
-        //         readahead_pages.erase(page_id);
-        //         auto handler = std::move(readahead_handler).wait_ready();
-        //         pages.emplace(page_id, std::move(handler));
-        //         return pages.at(page_id);
-        //     }
-        //     else {
-        //         auto handler = page_cache->get_page(page_id);
-        //         pages.emplace(page_id, std::move(handler));
-        //         return pages.at(page_id);
-        //     }
-        // };
-
-        // auto readahead_page = [this](
-        //     std::unordered_map<page_id_t, ReadAheadPageHandler>& readahead_pages,
-        //     page_id_t page_id) {
-        //     if (readahead_pages.contains(page_id)) {
-        //         return;
-        //     }
-        //     auto handler = page_cache->readahead_page(page_id);
-        //     if (handler) {
-        //         readahead_pages.emplace(page_id, std::move(handler.value()));
-        //     }
-        // };
 
         dist_t lowerBound;
         {
             auto [ep_page_id, ep_offset] = get_level0_offset(ep_id);
-            auto ep_page_handler = page_cache->get_page(ep_page_id);
+            auto ep_page_handler = co_await page_cache->get_page(ep_page_id);
             PointPageLevel0 ep_page(ep_page_handler, ep_offset, this); 
             if (bare_bone_search || 
                 // (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
@@ -535,14 +502,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         bool flag_stop_search = false;
         while (!candidate_set.empty() && !flag_stop_search) {
-            // layer based search for using page cache
-            // Update Layer pages and readahead pages data structure
-            // std::swap(cur_level_node_pages, cur_level_neighbor_pages);  // last level neighbor pages become current level node pages
-            // std::swap(cur_level_node_readahead_pages, cur_level_neighbor_readahead_pages); // last level neighbor readahead pages become current level node readahead pages
-            // std::swap(cur_level_neighbor_readahead_pages, cand_node_neighbor_readahead_pages);  // last level candidate neighbor readahead pages become current level neighbor readahead pages
-            // cur_level_neighbor_pages.clear();  // clear last level node pages
-            // cand_node_neighbor_readahead_pages.clear();  // clear last level neighbor readahead pages
-
             auto layer_count = candidate_set.size();
             while (layer_count--) {
                 std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -564,7 +523,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 tableint current_node_id = current_node_pair.second;
                 auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
-                auto cur_node_page_handler = page_cache->get_page(cur_page_id);
+                auto cur_node_page_handler = co_await page_cache->get_page(cur_page_id);
                 PointPageLevel0 current_node_page(cur_node_page_handler, cur_off, this);
 
                 // int *data = (int *) get_linklist0(current_node_id);
@@ -613,7 +572,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     //     }
                     // }
 
-                    auto cand_page_handler = page_cache->get_page(cand_page_id);
+                    auto cand_page_handler = co_await page_cache->get_page(cand_page_id);
                     PointPageLevel0 cand_page(cand_page_handler, cand_off, this);
 
                     // char *currObj1 = (getDataByInternalId(candidate_id));
@@ -658,7 +617,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         top_candidates.pop();
                         if (!bare_bone_search && stop_condition) {
                             auto [page_id, off] = get_level0_offset(id);
-                            auto page_handler = page_cache->get_page(page_id);
+                            auto page_handler = co_await page_cache->get_page(page_id);
                             PointPageLevel0 page(page_handler, off, this);
                             // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
                             stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
@@ -675,7 +634,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return top_candidates;
+        co_return top_candidates;
     }
 
 
@@ -977,7 +936,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Write page cache metadata (default values for backward compatibility)
         // If page_size_ is 0, this is being saved from an index created without page cache support
         // In this case, we use a default page size and write the old format
-        size_t page_size = page_size_ > 0 ? page_size_ : 32768;  // default 32KB page
+        size_t page_size = page_size_ > 0 ? page_size_ : 16384;  // default 16KB page
         writeBinaryPOD(output, page_size);
 
         // Calculate level 0 page-aligned layout
@@ -1074,7 +1033,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0, size_t cache_size_i = 0) {
+    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0, size_t cache_size_i = 0, size_t thread_num = 4) {
         std::ifstream input(location, std::ios::binary);
 
         if (!input.is_open())
@@ -1119,7 +1078,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             // Default cache size: 256MB or max_elements * page_size, whichever is smaller
             cache_size = std::min(max_elements_ * page_size_, static_cast<size_t>(256 * 1024 * 1024));
         }
-        page_cache = std::unique_ptr<HnswPageCache>(new HnswPageCache(location, page_size_, cache_size));
+
+        // Initialize executors based on thread_num
+        executors_ptr = std::make_unique<std::vector<HnswExecutor::UringExecutor*>>();
+        for (size_t i = 0; i < thread_num; i++) {
+            executors_ptr->emplace_back(new HnswExecutor::UringExecutor(static_cast<int>(i)));
+            (*executors_ptr)[i]->start();
+        }
+
+        page_cache = std::unique_ptr<HnswPageCacheDispatcher>(new HnswPageCacheDispatcher(*executors_ptr, location, page_size_, cache_size));
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
@@ -1669,16 +1636,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         enterpoint_node_ = id_to_store_order[enterpoint_node_];
     }
 
-    std::priority_queue<std::pair<dist_t, labeltype >>
+    Lazy<std::priority_queue<std::pair<dist_t, labeltype >>>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
-        if (cur_element_count == 0) return result;
+        if (cur_element_count == 0) co_return result;
 
         tableint currObj = enterpoint_node_;
         dist_t curdist;
         {
             auto [page_id, offset] = get_level0_offset(enterpoint_node_);
-            auto page_handler = page_cache->get_page(page_id);
+            auto page_handler = co_await page_cache->get_page(page_id);
             PointPageLevel0 page(page_handler, offset, this);
             curdist = fstdistfunc_(query_data, page.get_data(), dist_func_param_);
         }
@@ -1690,8 +1657,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 // unsigned int *data = (unsigned int *) get_linklist(currObj, level);
                 // int size = getListCount(data);
-                auto [page_id, offset] = get_higher_level_offset(currObj, level);
-                PointPageHigherLevel page(page_cache->get_page(page_id), offset);
+                auto [page_id, offset] = co_await get_higher_level_offset(currObj, level);
+                PointPageHigherLevel page(co_await page_cache->get_page(page_id), offset);
                 int size = page.get_neighbor_count();
 
                 metric_hops++;
@@ -1705,7 +1672,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         throw std::runtime_error("cand error");
 
                     auto [page_id, offset] = get_level0_offset(cand);
-                    auto page_handler = page_cache->get_page(page_id);
+                    auto page_handler = co_await page_cache->get_page(page_id);
                     PointPageLevel0 cand_page(page_handler, offset, this);
                     // dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
@@ -1722,10 +1689,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
+            top_candidates = co_await searchBaseLayerST<true>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<false>(
+            top_candidates = co_await searchBaseLayerST<false>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         }
 
@@ -1735,13 +1702,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         while (top_candidates.size() > 0) {
             std::pair<dist_t, tableint> rez = top_candidates.top();
             auto [page_id, offset] = get_level0_offset(rez.second);
-            auto page_handler = page_cache->get_page(page_id);
+            auto page_handler = co_await page_cache->get_page(page_id);
             PointPageLevel0 page(page_handler, offset, this);
             // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             result.push(std::pair<dist_t, labeltype>(rez.first, page.get_label()));
             top_candidates.pop();
         }
-        return result;
+        co_return result;
     }
 
 
