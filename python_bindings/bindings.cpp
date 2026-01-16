@@ -4,6 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "hnswlib.h"
+#include "hnswlib/metric.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
@@ -742,6 +743,26 @@ class Index {
         return appr_alg->get_memory_transfer_kb();
     }
 
+    std::vector<double> get_latency_ms() const {
+        return appr_alg->get_latency_ms();
+    }
+
+    std::vector<DetailLatency> get_detailed_latency() const {
+        return appr_alg->get_detailed_latency();
+    }
+
+    double get_qps(double avg_latency_ms) const {
+        return appr_alg->get_qps(avg_latency_ms);
+    }
+
+    double get_avg_depth_mean() const {
+        return appr_alg->get_avg_depth_mean();
+    }
+
+    double get_avg_depth_std() const {
+        return appr_alg->get_avg_depth_std();
+    }
+
     void reset_metrics_counter() {
         appr_alg->reset_metrics_counter();
     }
@@ -936,6 +957,13 @@ PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
         m.attr("__version__") = VERSION_INFO;
 
+        // DetailLatency structure binding
+        py::class_<DetailLatency>(m, "DetailLatency")
+            .def(py::init<>())
+            .def(py::init<double, double>(), py::arg("cpu_ms"), py::arg("io_ms"))
+            .def_readwrite("cpu_ms", &DetailLatency::cpu_ms)
+            .def_readwrite("io_ms", &DetailLatency::io_ms);
+
         py::class_<Index<float>>(m, "Index")
         .def(py::init(&Index<float>::createFromParams), py::arg("params"))
            /* WARNING: Index::createFromIndex is not thread-safe with Index::addItems */
@@ -981,6 +1009,11 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_cache_hit_rate", &Index<float>::get_cache_hit_rate)
         .def("get_io_op_num", &Index<float>::get_io_op_num)
         .def("get_memory_transfer_kb", &Index<float>::get_memory_transfer_kb)
+        .def("get_latency_ms", &Index<float>::get_latency_ms)
+        .def("get_detailed_latency", &Index<float>::get_detailed_latency)
+        .def("get_qps", &Index<float>::get_qps, py::arg("avg_latency_ms"))
+        .def("get_avg_depth_mean", &Index<float>::get_avg_depth_mean)
+        .def("get_avg_depth_std", &Index<float>::get_avg_depth_std)
         .def("reset_metrics_counter", &Index<float>::reset_metrics_counter)
         .def_readonly("space", &Index<float>::space_name)
         .def_readonly("dim", &Index<float>::dim)

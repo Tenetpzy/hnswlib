@@ -1,5 +1,6 @@
 #include "hnswcache.h"
 #include "executor.h"
+#include "metric.h"
 #include <cassert>
 #include <fcntl.h>
 #include <stdexcept>
@@ -62,8 +63,9 @@ PageHandler& PageHandler::operator=(PageHandler&& other) noexcept {
 //     return *this;
 // }
 
-HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher) {
+HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher, std::vector<SSDChannelMetrics> *channel_metrics) {
     this->dispatcher = dispatcher;
+    this->channel_metrics = channel_metrics;
     this->location = location;
     this->page_size = page_size;
     size_t max_page_count = cache_size / page_size;
@@ -92,7 +94,7 @@ HnswPageCache::~HnswPageCache() {
     }
 }
 
-Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
+Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id, ReqMetrics &req_metrics) {
     // Check if the page is already in cache
     auto it = id_to_page.find(page_id);
     if (it != id_to_page.end()) {
@@ -101,8 +103,9 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
         PageEntry* entry = it->second;
         ++entry->access_count;
         add_page_ref(entry);
-
+        req_metrics.off_cpu();
         co_await PageLoadingAwaiter(entry);
+        req_metrics.on_cpu();
         co_return PageHandler(dispatcher, entry);
     }
 
@@ -115,7 +118,7 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
         entry = avail_page_entries.back();
         avail_page_entries.pop_back();
     } else {
-        entry = co_await evict_one_for_use();
+        entry = co_await evict_one_for_use(req_metrics);
     }
 
     if (entry) {
@@ -128,7 +131,7 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id) {
         ++entry->access_count;
         add_page_ref(entry);
 
-        co_await load_from_disk(entry);
+        co_await load_from_disk(entry, req_metrics);
         co_return PageHandler(dispatcher, entry);
     }
 
@@ -292,10 +295,12 @@ private:
     HnswPageCache *cache;
 };
 
-Lazy<PageEntry*> HnswPageCache::evict_one_for_use() {
-
-    while (TAILQ_EMPTY(&history_list) && TAILQ_EMPTY(&buffer_list))
+Lazy<PageEntry*> HnswPageCache::evict_one_for_use(ReqMetrics &req_metrics) {
+    while (TAILQ_EMPTY(&history_list) && TAILQ_EMPTY(&buffer_list)) {
+        req_metrics.off_cpu();
         co_await EvictAwaiter(this);
+        req_metrics.on_cpu();
+    }
     
     assert(!TAILQ_EMPTY(&history_list) || !TAILQ_EMPTY(&buffer_list));
 
@@ -316,10 +321,17 @@ Lazy<PageEntry*> HnswPageCache::evict_one_for_use() {
     }
 }
 
-Lazy<void> HnswPageCache::load_from_disk(PageEntry *entry) {
+Lazy<void> HnswPageCache::load_from_disk(PageEntry *entry, ReqMetrics &req_metrics) {
     off_t offset = static_cast<off_t>(entry->page_id) * page_size;
+
+    req_metrics.off_cpu();
+    auto channel_id = entry->page_id % ssd_channel_num;
+    (*channel_metrics)[channel_id].add_req();
     auto bytes_read = co_await HnswExecutor::UringContext::current_executor()
-        .async_read(fd, entry->data, static_cast<unsigned>(page_size), offset);
+        .async_read(fd, entry->data, static_cast<unsigned>(page_size), offset, (*channel_metrics)[channel_id]);
+    req_metrics.on_cpu();
+
+    req_metrics.add_io();
     ++io_op_num;
     memory_transfer_bytes += static_cast<size_t>(bytes_read);
     if (bytes_read < 0) {

@@ -78,6 +78,12 @@ int main() {
         if (label == i) correct++;
     }
 
+    auto latencies = alg_hnsw->get_latency_ms();
+    double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    double qps = alg_hnsw->get_qps(avg_latency);
+    double avg_depth_mean = alg_hnsw->page_cache->get_avg_depth_mean();
+    double avg_depth_std = alg_hnsw->page_cache->get_avg_depth_std();
+
     float recall = (float)correct / max_elements;
     std::cout << "Recall of deserialized index: " << recall << "\n";
     std::cout 
@@ -86,7 +92,13 @@ int main() {
         << "IO operations: "
         << alg_hnsw->get_io_op_num() << "\n"
         << "Memory transfer (KB): "
-        << alg_hnsw->get_memory_transfer_kb() << "\n";
+        << alg_hnsw->get_memory_transfer_kb() << "\n"
+        << "Average latency (ms): "
+        << avg_latency << "\n"
+        << "QPS: "
+        << qps << "\n"
+        << "Avg channel depth: "
+        << avg_depth_mean << " +/- " << avg_depth_std << "\n";
 
     delete[] data;
     delete alg_hnsw;

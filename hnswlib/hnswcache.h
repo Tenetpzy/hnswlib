@@ -1,6 +1,7 @@
 #pragma once
 
 #include <coroutine>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <sys/queue.h>
@@ -11,6 +12,7 @@
 
 #include "async_simple/coro/Lazy.h"
 #include "executor.h"
+#include "metric.h"
 
 namespace hnswlib {
 
@@ -158,7 +160,7 @@ public:
      * page_size: size in byte of each page
      * cache_size: total available byte for cache
      */
-    HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher);
+    HnswPageCache(const std::string &location, size_t page_size, size_t cache_size, HnswPageCacheDispatcher *dispatcher, std::vector<SSDChannelMetrics> *channel_metrics);
     ~HnswPageCache();
 
     /*
@@ -172,7 +174,7 @@ public:
      * 
      * If the page is in cache and ready, just increase the page's refcount by 1
      */
-    Lazy<PageHandler> get_page(page_id_t page_id);
+    Lazy<PageHandler> get_page(page_id_t page_id, ReqMetrics &req_metrics);
 
     /*
      * Async prefetch the page into cache, should not block caller
@@ -210,6 +212,10 @@ public:
         memory_transfer_bytes = 0;
     }
 
+    size_t get_page_num() const {
+        return page_count;
+    }
+
 private:
     /*
      * Decrease the reference count of the page
@@ -226,9 +232,9 @@ private:
 
     void unpin(PageEntry *entry);
 
-    Lazy<PageEntry*> evict_one_for_use();
+    Lazy<PageEntry*> evict_one_for_use(ReqMetrics &req_metrics);
 
-    Lazy<void> load_from_disk(PageEntry *entry);
+    Lazy<void> load_from_disk(PageEntry *entry, ReqMetrics &req_metrics);
 
     void load_from_disk_async(PageEntry *entry);
 
@@ -236,6 +242,7 @@ private:
     static constexpr int K = 3;  // LRU-K
 
     HnswPageCacheDispatcher *dispatcher;
+    std::vector<SSDChannelMetrics> *channel_metrics;
 
     std::string location;
 
@@ -254,9 +261,9 @@ private:
     std::unordered_map<page_id_t, PageEntry*> id_to_page; // map page_id to list or using entry iterator
     std::deque<std::coroutine_handle<>> evict_waiters;
 
-    size_t cache_hits{0}, cache_miss{0};
-    size_t io_op_num{0};
-    size_t memory_transfer_bytes{0};
+    std::atomic_size_t cache_hits{0}, cache_miss{0};
+    std::atomic_size_t io_op_num{0};
+    std::atomic_size_t memory_transfer_bytes{0};
 
     friend class ReadAheadPageHandler;
     friend class EvictAwaiter;
@@ -267,20 +274,20 @@ class HnswPageCacheDispatcher {
 public:
     HnswPageCacheDispatcher(std::vector<HnswExecutor::UringExecutor*> &executors, 
         const std::string &location, size_t page_size, size_t cache_size)
-        : executors(executors) {
+        : executors(executors), channel_metrics(ssd_channel_num) {
         size_t per_cache_size = cache_size / executors.size();
         for (size_t i = 0; i < executors.size(); i++) {
-            caches.emplace_back(std::make_unique<HnswPageCache>(location, page_size, per_cache_size, this));
+            caches.emplace_back(std::make_unique<HnswPageCache>(location, page_size, per_cache_size, this, &channel_metrics));
         }
     }
 
-    Lazy<PageHandler> get_page(page_id_t page_id) {
+    Lazy<PageHandler> get_page(page_id_t page_id, ReqMetrics &req_metrics) {
         size_t idx = page_id % executors.size();
         if (executors[idx]->currentThreadInExecutor()) {
-            co_return co_await caches[idx]->get_page(page_id);
+            co_return co_await caches[idx]->get_page(page_id, req_metrics);
         } else {
             // via返回rescheduledLazy，它始终会把当前协程挂起并在另一个executor启动
-            co_return co_await caches[idx]->get_page(page_id).via(executors[idx]);
+            co_return co_await caches[idx]->get_page(page_id, req_metrics).via(executors[idx]);
         }
     }
 
@@ -316,10 +323,41 @@ public:
         return total_io_op;
     }
 
+    double get_avg_depth_mean() const {
+        if (channel_metrics.empty()) return 0.0;
+        double sum = 0.0;
+        for (const auto &metrics : channel_metrics) {
+            sum += metrics.get_avg_depth();
+        }
+        return sum / channel_metrics.size();
+    }
+
+    double get_avg_depth_std() const {
+        if (channel_metrics.empty()) return 0.0;
+        double mean = get_avg_depth_mean();
+        double variance_sum = 0.0;
+        for (const auto &metrics : channel_metrics) {
+            double diff = metrics.get_avg_depth() - mean;
+            variance_sum += diff * diff;
+        }
+        return std::sqrt(variance_sum / channel_metrics.size());
+    }
+
     void reset_metrics_counter() {
         for (const auto &cache : caches) {
             cache->reset_metrics_counter();
         }
+        for (auto &metrics : channel_metrics) {
+            metrics.reset();
+        }
+    }
+
+    size_t get_page_num() const {
+        size_t total_pages = 0;
+        for (const auto &cache : caches) {
+            total_pages += cache->get_page_num();
+        }
+        return total_pages;
     }
 
 private:
@@ -341,6 +379,7 @@ private:
 
 private:
     std::vector<HnswExecutor::UringExecutor*> &executors;
+    std::vector<SSDChannelMetrics> channel_metrics;
     std::vector<std::unique_ptr<HnswPageCache>> caches;
 
     friend class PageHandler;

@@ -14,50 +14,16 @@
 #include <coroutine>
 #include <thread>
 #include <atomic>
-#include <x86intrin.h>
 #include <cassert>
 #include <cstring>
+#include <chrono>
 #include "async_simple/Executor.h"
 #include "async_simple/coro/Lazy.h"
+#include "metric.h"
 #include "mpsc.h"
+#include <x86intrin.h>
 
 namespace HnswExecutor {
-
-class TscClock {
-public:
-    static double get_ticks_per_ns() {
-        static const double ticks_per_ns = []() {
-            // 预热：先做一次短 sleep，让 CPU 脱离深度睡眠状态，恢复全速频率
-            // 防止从 C-State 唤醒过程影响校准
-            using namespace std::chrono;
-            std::this_thread::sleep_for(milliseconds(10));
-            auto start_time = steady_clock::now();
-            uint64_t start_tsc = __rdtsc();
-            std::this_thread::sleep_for(milliseconds(100));
-            uint64_t end_tsc = __rdtsc();
-            auto end_time = steady_clock::now();
-            auto duration_ns = duration_cast<nanoseconds>(end_time - start_time).count();
-            return static_cast<double>(end_tsc - start_tsc) / duration_ns;
-        }();
-        return ticks_per_ns;
-    }
-
-    static uint64_t ms_to_ticks(uint64_t ms) {
-        return static_cast<uint64_t>(ms * 1000000.0 * get_ticks_per_ns());
-    }
-    
-    static uint64_t us_to_ticks(uint64_t us) {
-        return static_cast<uint64_t>(us * 1000.0 * get_ticks_per_ns());
-    }
-
-    static inline uint64_t now() __attribute__((always_inline)) {
-        return __rdtsc();
-    }
-    
-    static inline void relax() __attribute__((always_inline)) {
-        _mm_pause(); 
-    }
-};
 
 // 用于 O_DIRECT 的对齐内存分配器
 struct AlignedBuffer {
@@ -79,7 +45,7 @@ class UringExecutor;
 
 class UringContext {
 public:
-    static UringExecutor& current_executor() {
+    static UringExecutor& current_executor() __attribute__((always_inline)) {
         return *current_executor_ptr;
     }
 
@@ -110,7 +76,7 @@ public:
         close(ev_fd);
     }
 
-    int id() const {
+    int id() const __attribute__((always_inline)) {
         return cpu_id;
     }
 
@@ -156,7 +122,7 @@ public:
 
     // 提交一个IO操作，返回值是res
     // 协程通过co_await this->async_read(fd, buf, len, offset)来等待
-    auto async_read(int fd, void* buf, unsigned len, off_t offset) {
+    auto async_read(int fd, void* buf, unsigned len, off_t offset, SSDChannelMetrics &channel_metric) {
         struct ReadAwaiter : public CqeHandler {
             UringExecutor* sched;
             int fd; 
@@ -164,11 +130,11 @@ public:
             unsigned len; 
             off_t off;
             int32_t result = 0;
+            SSDChannelMetrics &channel_metric;
             std::coroutine_handle<> coro;
 
-            ReadAwaiter(UringExecutor* s, int f, void* b, unsigned l, off_t o)
-                : sched(s), fd(f), buf(b), len(l), off(o) {}
-
+            ReadAwaiter(UringExecutor* s, int f, void* b, unsigned l, off_t o, SSDChannelMetrics &cm)
+                : sched(s), fd(f), buf(b), len(l), off(o), channel_metric(cm) {}
             bool await_ready() const { return false; }
 
             void await_suspend(std::coroutine_handle<> h) {
@@ -183,10 +149,11 @@ public:
             void complete(int32_t res) override {
                 result = res;
                 coro.resume(); 
+                channel_metric.sub_req();
             }
         };
 
-        return ReadAwaiter{this, fd, buf, len, offset};
+        return ReadAwaiter{this, fd, buf, len, offset, channel_metric};
     }
 
     
@@ -253,8 +220,8 @@ private:
     }
 
     void run_loop() {
-        const uint64_t IDLE_TIMEOUT_TICKS = TscClock::ms_to_ticks(10);
-        uint64_t start_idle_tsc = 0;
+        constexpr auto IDLE_TIMEOUT = std::chrono::milliseconds(10);
+        std::chrono::steady_clock::time_point start_idle_time;
         bool is_spinning = false;
 
         while (running) {
@@ -293,15 +260,15 @@ private:
 
             if (!is_spinning) {
                 // 刚发现没事做，记录当前时间，开始计时
-                start_idle_tsc = TscClock::now();
+                start_idle_time = std::chrono::steady_clock::now();
                 is_spinning = true;
             } else {
                 // 已经在自旋了，检查是否超时
-                uint64_t current_tsc = TscClock::now();
-                if (current_tsc - start_idle_tsc < IDLE_TIMEOUT_TICKS) {
+                auto current_time = std::chrono::steady_clock::now();
+                if (current_time - start_idle_time < IDLE_TIMEOUT) {
                     // 未超时：CPU降频空转
-                    TscClock::relax(); 
-                    continue; 
+                    _mm_pause();
+                    continue;
                 }
 
                 // 休眠
