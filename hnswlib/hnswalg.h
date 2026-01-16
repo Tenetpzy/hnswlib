@@ -986,7 +986,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         // Track link offsets for each element
         std::vector<size_t> link_offsets;
-        link_offsets.reserve(cur_element_count);
+        link_offsets.reserve(cur_element_count + 1);
 
         // Write higher level links and record their offsets (with page alignment)
         for (size_t i = 0; i < cur_element_count; i++) {
@@ -1007,6 +1007,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             if (linkListSize)
                 output.write(linkLists_[origin_id], linkListSize);
         }
+        link_offsets.push_back(output.tellp()); // End offset, for loadIndex recovery
 
         // Pad to page boundary for link offset array
         size_t link_offset_array_offset = output.tellp();
@@ -1021,7 +1022,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         link_offset_array_page_id = link_offset_array_offset / page_size;
 
         // Write link offset array
-        for (size_t i = 0; i < cur_element_count; i++) {
+        for (size_t i = 0; i < cur_element_count + 1; i++) {
             writeBinaryPOD(output, link_offsets[i]);
         }
 
@@ -1072,7 +1073,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
 
-        // Initialize page cache for on-demand loading
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        // Initialize page cache for on-demand L0 loading
         size_t cache_size = cache_size_i;
         if (cache_size == 0) {
             // Default cache size: 256MB or max_elements * page_size, whichever is smaller
@@ -1088,23 +1092,63 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         page_cache = std::unique_ptr<HnswPageCacheDispatcher>(new HnswPageCacheDispatcher(*executors_ptr, location, page_size_, cache_size));
 
-        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-
         std::vector<std::mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
 
         visited_list_pool_.reset(new VisitedListPool(1, max_elements));
 
-        // Don't load element data, link lists, or level 0 data
-        // These will be loaded on-demand during search operations
+        // 分配 linkLists_ 指针数组
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklists");
+        memset(linkLists_, 0, sizeof(void *) * max_elements);
+
+        // 初始化 element_levels_ 数组
+        element_levels_ = std::vector<int>(max_elements);
+
+        // 读取 link offset array 来定位每个元素的高层链接
+        size_t link_offset_array_offset = link_offset_array_page_id_ * page_size_;
+        input.seekg(link_offset_array_offset, std::ios::beg);
+        
+        std::vector<size_t> link_offsets(cur_element_count + 1);
+        for (size_t i = 0; i < cur_element_count + 1; i++) {
+            readBinaryPOD(input, link_offsets[i]);
+        }
+        
+        // 计算每个元素的高层链接并加载到内存
+        for (size_t i = 0; i < cur_element_count; i++) {
+            size_t link_offset = link_offsets[i];
+            size_t next_offset;
+            next_offset = link_offsets[i + 1];
+            
+            size_t linkListSize = next_offset - link_offset;
+            
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                // 计算层级数
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                
+                // 分配内存并读取高层链接
+                linkLists_[i] = (char *) malloc(linkListSize);
+                if (linkLists_[i] == nullptr)
+                    throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklist");
+                
+                // 定位到文件中的位置并读取
+                input.seekg(link_offset, std::ios::beg);
+                input.read(linkLists_[i], linkListSize);
+            }
+        }
+        
+        // 初始化其余元素（如果 max_elements > cur_element_count）
+        for (size_t i = cur_element_count; i < max_elements; i++) {
+            element_levels_[i] = 0;
+            linkLists_[i] = nullptr;
+        }
 
         revSize_ = 1.0 / mult_;
         ef_ = 10;
-
-        // Note: In on-demand loading mode, we don't pre-load any element data
-        // The actual element data (vectors, labels, links) will be loaded via page cache
-        // when needed during search operations
 
         input.close();
 
@@ -1655,17 +1699,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             while (changed) {
                 changed = false;
 
-                // unsigned int *data = (unsigned int *) get_linklist(currObj, level);
-                // int size = getListCount(data);
-                auto [page_id, offset] = co_await get_higher_level_offset(currObj, level);
-                PointPageHigherLevel page(co_await page_cache->get_page(page_id), offset);
-                int size = page.get_neighbor_count();
+                unsigned int *data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                // auto [page_id, offset] = co_await get_higher_level_offset(currObj, level);
+                // PointPageHigherLevel page(co_await page_cache->get_page(page_id), offset);
+                // int size = page.get_neighbor_count();
 
                 metric_hops++;
                 metric_distance_computations+=size;
 
-                // tableint *datal = (tableint *) (data + 1);
-                tableint *datal = page.get_neighbor_list();
+                tableint *datal = (tableint *) (data + 1);
+                // tableint *datal = page.get_neighbor_list();
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
@@ -1674,7 +1718,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     auto [page_id, offset] = get_level0_offset(cand);
                     auto page_handler = co_await page_cache->get_page(page_id);
                     PointPageLevel0 cand_page(page_handler, offset, this);
-                    // dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
 
                     if (d < curdist) {
