@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <memory>
 #include <utility>
+#include <fstream>
 #include "async_simple/coro/Lazy.h"
 #include "metric.h"
 

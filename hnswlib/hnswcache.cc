@@ -325,7 +325,7 @@ Lazy<void> HnswPageCache::load_from_disk(PageEntry *entry, ReqMetrics &req_metri
     off_t offset = static_cast<off_t>(entry->page_id) * page_size;
 
     req_metrics.off_cpu();
-    auto channel_id = entry->page_id % ssd_channel_num;
+    auto channel_id = entry->page_id % ssd_channel_num;  // same as simulator
     (*channel_metrics)[channel_id].add_req();
     auto bytes_read = co_await HnswExecutor::UringContext::current_executor()
         .async_read(fd, entry->data, static_cast<unsigned>(page_size), offset, (*channel_metrics)[channel_id]);
