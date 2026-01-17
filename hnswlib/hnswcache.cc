@@ -1,4 +1,5 @@
 #include "hnswcache.h"
+#include "metric.h"
 #include <atomic>
 #include <cassert>
 #include <fcntl.h>
@@ -26,7 +27,8 @@ PageHandler& PageHandler::operator=(PageHandler&& other) noexcept {
     return *this;
 }
 
-HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size) {
+HnswPageCache::HnswPageCache(const std::string &location, size_t page_size, size_t cache_size)
+    : channel_metrics(ssd_channel_num) {
     this->location = location;
     this->page_size = page_size;
     size_t max_page_count = cache_size / page_size;
@@ -54,7 +56,7 @@ HnswPageCache::~HnswPageCache() {
     }
 }
 
-PageHandler HnswPageCache::get_page(page_id_t page_id) {
+PageHandler HnswPageCache::get_page(page_id_t page_id, ReqMetrics& req_metrics) {
     std::unique_lock<std::mutex> lock(lru_mutex);
 
     // Check if the page is already in cache
@@ -69,9 +71,11 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         // Wait for page to be ready if it's still loading
         std::unique_lock<std::mutex> entry_lock(entry->mtx);
         if (entry->state == PageEntry::State::Loading) {
+            req_metrics.off_cpu();
             entry->cv.wait(entry_lock, [entry] {
                 return entry->state == PageEntry::State::InCache;
             });
+            req_metrics.on_cpu();
         }
 
         return PageHandler(this, entry);
@@ -90,8 +94,10 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
         if (!TAILQ_EMPTY(&lru_list)) {
             entry = evict_one_for_use();
         } else {
+            req_metrics.off_cpu();
             // No evictable entries, wait until one becomes available
             evict_cv.wait(lock, [this] { return !TAILQ_EMPTY(&lru_list); });
+            req_metrics.on_cpu();
             // After waking up, evict from LRU list (guaranteed to be non-empty)
             entry = evict_one_for_use();
         }
@@ -108,7 +114,10 @@ PageHandler HnswPageCache::get_page(page_id_t page_id) {
 
         // Load page from disk without holding the lru lock
         lock.unlock();
+        req_metrics.off_cpu();
         load_from_disk(entry);
+        req_metrics.on_cpu();
+        req_metrics.add_io();
 
         {
             // Update state to InCache
@@ -182,7 +191,10 @@ PageEntry* HnswPageCache::evict_one_for_use() {
 void HnswPageCache::load_from_disk(PageEntry *entry) {
     // Use pread for thread-safe, atomic read from specific offset
     off_t offset = static_cast<off_t>(entry->page_id) * page_size;
+    auto channel_id = entry->page_id % ssd_channel_num;
+    channel_metrics[channel_id].add_req();
     ssize_t bytes_read = ::pread(fd, entry->data, page_size, offset);
+    channel_metrics[channel_id].sub_req();
     ++io_op_num;
     memory_transfer_bytes += static_cast<size_t>(bytes_read);
     if (bytes_read < 0) {

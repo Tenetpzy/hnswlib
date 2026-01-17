@@ -42,13 +42,20 @@ int main() {
     delete alg_hnsw;
 
     // Deserialize index and check recall
-    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, 98304);
+    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, 48 * 16384);
     float correct = 0;
     for (int i = 0; i < max_elements; i++) {
         std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + i * dim, 1);
         hnswlib::labeltype label = result.top().second;
         if (label == i) correct++;
     }
+
+    auto latencies = alg_hnsw->get_latency_ms();
+    double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    double qps = alg_hnsw->get_qps(avg_latency, 4);
+    double avg_depth_mean = alg_hnsw->get_avg_depth_mean();
+    double avg_depth_std = alg_hnsw->get_avg_depth_std();
+
     float recall = (float)correct / max_elements;
     std::cout << "Recall of deserialized index: " << recall << "\n";
     std::cout 
@@ -57,7 +64,13 @@ int main() {
         << "IO operations: "
         << alg_hnsw->get_io_op_num() << "\n"
         << "Memory transfer (KB): "
-        << alg_hnsw->get_memory_transfer_kb() << "\n";
+        << alg_hnsw->get_memory_transfer_kb() << "\n"
+        << "Average latency (ms): "
+        << avg_latency << "\n"
+        << "QPS: "
+        << qps << "\n"
+        << "Avg channel depth: "
+        << avg_depth_mean << " +/- " << avg_depth_std << "\n";
 
     delete[] data;
     delete alg_hnsw;

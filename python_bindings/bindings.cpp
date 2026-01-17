@@ -4,6 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "hnswlib.h"
+#include "hnswlib/metric.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
@@ -228,9 +229,9 @@ class Index {
     }
 
 
-    void loadIndex(const std::string &path_to_index, size_t max_elements, size_t cache_size, bool allow_replace_deleted) {
+    void loadIndex(const std::string &path_to_index, size_t max_elements, size_t cache_size, bool allow_replace_deleted, size_t thread_num = 1) {
       if (appr_alg) {
-          std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
+        //   std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
           delete appr_alg;
       }
       appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, cache_size, false, max_elements, allow_replace_deleted);
@@ -739,6 +740,26 @@ class Index {
         return appr_alg->get_memory_transfer_kb();
     }
 
+    std::vector<double> get_latency_ms() const {
+        return appr_alg->get_latency_ms();
+    }
+
+    std::vector<DetailLatency> get_detailed_latency() const {
+        return appr_alg->get_detailed_latency();
+    }
+
+    double get_qps(double avg_latency_ms, size_t thread_num = 1) const {
+        return appr_alg->get_qps(avg_latency_ms);
+    }
+
+    double get_avg_depth_mean() const {
+        return appr_alg->get_avg_depth_mean();
+    }
+
+    double get_avg_depth_std() const {
+        return appr_alg->get_avg_depth_std();
+    }
+
     void reset_metrics_counter() {
         appr_alg->reset_metrics_counter();
     }
@@ -933,6 +954,13 @@ PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
         m.attr("__version__") = VERSION_INFO;
 
+        // DetailLatency structure binding
+        py::class_<DetailLatency>(m, "DetailLatency")
+            .def(py::init<>())
+            .def(py::init<double, double>(), py::arg("cpu_ms"), py::arg("io_ms"))
+            .def_readwrite("cpu_ms", &DetailLatency::cpu_ms)
+            .def_readwrite("io_ms", &DetailLatency::io_ms);
+
         py::class_<Index<float>>(m, "Index")
         .def(py::init(&Index<float>::createFromParams), py::arg("params"))
            /* WARNING: Index::createFromIndex is not thread-safe with Index::addItems */
@@ -969,7 +997,8 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
             py::arg("cache_size") = 0,
-            py::arg("allow_replace_deleted") = false)
+            py::arg("allow_replace_deleted") = false,
+            py::arg("thread_num") = 1)
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
@@ -978,6 +1007,11 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_cache_hit_rate", &Index<float>::get_cache_hit_rate)
         .def("get_io_op_num", &Index<float>::get_io_op_num)
         .def("get_memory_transfer_kb", &Index<float>::get_memory_transfer_kb)
+        .def("get_latency_ms", &Index<float>::get_latency_ms)
+        .def("get_detailed_latency", &Index<float>::get_detailed_latency)
+        .def("get_qps", &Index<float>::get_qps, py::arg("avg_latency_ms"), py::arg("thread_num") = 1)
+        .def("get_avg_depth_mean", &Index<float>::get_avg_depth_mean)
+        .def("get_avg_depth_std", &Index<float>::get_avg_depth_std)
         .def("reset_metrics_counter", &Index<float>::reset_metrics_counter)
         .def_readonly("space", &Index<float>::space_name)
         .def_readonly("dim", &Index<float>::dim)

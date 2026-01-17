@@ -8,6 +8,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cmath>
+#include "metric.h"
 
 namespace hnswlib {
 
@@ -32,7 +34,7 @@ class PageEntry {
     std::condition_variable cv; // for waiting entry loading threads
     std::mutex mtx; // for state and cv
 
-    PageEntry(): data(nullptr), in_lru_list(false), ref_count(0), state(State::NotInCache) {}
+    PageEntry(): data(nullptr), ref_count(0), in_lru_list(false), state(State::NotInCache) {}
 
     void release() {
         ref_count = 0;
@@ -103,7 +105,7 @@ public:
      * 
      * If the page is in cache and ready, just increase the page's refcount by 1
      */
-    PageHandler get_page(page_id_t page_id);
+    PageHandler get_page(page_id_t page_id, ReqMetrics& req_metrics);
 
     // /*
     //  * Async prefetch the page into cache, should not block caller
@@ -128,11 +130,38 @@ public:
         return static_cast<float>(memory_transfer_bytes) / 1024.0f;
     }
 
+    double get_avg_depth_mean() const {
+        if (channel_metrics.empty()) return 0.0;
+        double sum = 0.0;
+        for (const auto &metrics : channel_metrics) {
+            sum += metrics.get_avg_depth();
+        }
+        return sum / channel_metrics.size();
+    }
+
+    double get_avg_depth_std() const {
+        if (channel_metrics.empty()) return 0.0;
+        double mean = get_avg_depth_mean();
+        double variance_sum = 0.0;
+        for (const auto &metrics : channel_metrics) {
+            double diff = metrics.get_avg_depth() - mean;
+            variance_sum += diff * diff;
+        }
+        return std::sqrt(variance_sum / channel_metrics.size());
+    }
+
     void reset_metrics_counter() {
         cache_hits = 0;
         cache_miss = 0;
         io_op_num = 0;
         memory_transfer_bytes = 0;
+        for (auto &metrics : channel_metrics) {
+            metrics.reset();
+        }
+    }
+
+    size_t get_page_num() const {
+        return page_count;
     }
 
 private:
@@ -174,6 +203,7 @@ private:
 
     std::condition_variable evict_cv; // for evicting thread to wait for evictable page entry
     std::mutex lru_mutex;
+    std::vector<SSDChannelMetrics> channel_metrics;
 
     size_t cache_hits{0}, cache_miss{0};
     std::atomic_size_t io_op_num{0};

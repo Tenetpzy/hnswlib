@@ -1,10 +1,12 @@
 #pragma once
 
 #include "hnswcache.h"
+#include "metric.h"
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
 #include <cstddef>
+#include <mutex>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
@@ -150,6 +152,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     page_id_t level0_first_page_id_{0};  // page id of the first element in level 0
     page_id_t link_offset_array_page_id_{0};  // page id of the link offset array
 
+    mutable std::mutex metrics_mutex;
+    mutable std::vector<ReqMetrics> req_metrics_vec;
+
     HierarchicalNSW(
         SpaceInterface<dist_t> *s,
         const std::string &location,
@@ -266,14 +271,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     // return the link list offset of internal_id
-    std::pair<page_id_t, size_t> get_higher_level_offset(tableint internal_id, int level) const {
+    std::pair<page_id_t, size_t> get_higher_level_offset(tableint internal_id, int level, ReqMetrics& req_metrics) const {
         // Calculate page and offset for the link list
         size_t link_offset_entry_offset = internal_id * sizeof(size_t);
         size_t link_offset_entry_page_id = link_offset_array_page_id_ + link_offset_entry_offset / page_size_;
         size_t link_offset_entry_offset_in_page = link_offset_entry_offset % page_size_;
 
         // Load the page containing the link offset entry
-        auto link_array_page = page_cache->get_page(link_offset_entry_page_id);
+        auto link_array_page = page_cache->get_page(link_offset_entry_page_id, req_metrics);
 
         // Get the offset of this element's link list
         size_t *link_offset_ptr = (size_t *)(link_array_page.get_ptr() + link_offset_entry_offset_in_page);
@@ -354,10 +359,48 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return 0.0f;
     }
 
+    std::vector<double> get_latency_ms() const {
+        std::vector<double> latencies;
+        for (const auto &req_metric : req_metrics_vec) {
+            latencies.push_back(req_metric.get_latency_ms());
+        }
+        return latencies;
+    }
+
+    std::vector<DetailLatency> get_detailed_latency() const {
+        std::vector<DetailLatency> latencies;
+        for (const auto &req_metric : req_metrics_vec) {
+            latencies.push_back(req_metric.get_detailed_latency());
+        }
+        return latencies;
+    }
+
+    double get_qps(double avg_latency_ms, size_t thread_num = 1) const {
+        uint64_t parallel_num = std::min(thread_num, page_cache->get_page_num() / beam_width);
+        if (avg_latency_ms == 0.0) 
+            return 0.0;
+        return parallel_num * 1000.0 / avg_latency_ms;
+    }
+
+    double get_avg_depth_mean() const {
+        if (page_cache) {
+            return page_cache->get_avg_depth_mean();
+        }
+        return 0.0;
+    }
+
+    double get_avg_depth_std() const {
+        if (page_cache) {
+            return page_cache->get_avg_depth_std();
+        }
+        return 0.0;
+    }
+
     void reset_metrics_counter() {
         if (page_cache) {
             page_cache->reset_metrics_counter();
         }
+        req_metrics_vec.clear();
     }
 
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
@@ -450,6 +493,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         tableint ep_id,
         const void *data_point,
         size_t ef,
+        ReqMetrics& req_metrics,
         BaseFilterFunctor* isIdAllowed = nullptr,
         BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -462,7 +506,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t lowerBound;
         {
             auto [ep_page_id, ep_offset] = get_level0_offset(ep_id);
-            PointPageLevel0 ep_page(page_cache->get_page(ep_page_id), ep_offset, this); 
+            PointPageLevel0 ep_page(page_cache->get_page(ep_page_id, req_metrics), ep_offset, this); 
             if (bare_bone_search || 
                 // (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
                 (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(ep_page.get_label())))) {
@@ -505,7 +549,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint current_node_id = current_node_pair.second;
             auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
-            PointPageLevel0 current_node_page(page_cache->get_page(cur_page_id), cur_off, this);
+            PointPageLevel0 current_node_page(page_cache->get_page(cur_page_id, req_metrics), cur_off, this);
             // int *data = (int *) get_linklist0(current_node_id);
             int* data = (int *) current_node_page.get_neighbor_list();
             // size_t size = getListCount((linklistsizeint*)data);
@@ -537,7 +581,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     visited_array[candidate_id] = visited_array_tag;
 
                     auto [cand_page_id, cand_off] = get_level0_offset(candidate_id);
-                    PointPageLevel0 cand_page(page_cache->get_page(cand_page_id), cand_off, this);
+                    PointPageLevel0 cand_page(page_cache->get_page(cand_page_id, req_metrics), cand_off, this);
 
                     // char *currObj1 = (getDataByInternalId(candidate_id));
                     char *currObj1 = cand_page.get_data();
@@ -579,7 +623,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             top_candidates.pop();
                             if (!bare_bone_search && stop_condition) {
                                 auto [page_id, off] = get_level0_offset(id);
-                                PointPageLevel0 page(page_cache->get_page(page_id), off, this);
+                                PointPageLevel0 page(page_cache->get_page(page_id, req_metrics), off, this);
                                 // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
                                 stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
                                 flag_remove_extra = stop_condition->should_remove_extra();
@@ -1509,6 +1553,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        ReqMetrics req_metrics;
+        req_metrics.on_cpu();
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -1516,7 +1562,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t curdist;
         {
             auto [page_id, offset] = get_level0_offset(enterpoint_node_);
-            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            PointPageLevel0 page(page_cache->get_page(page_id, req_metrics), offset, this);
             curdist = fstdistfunc_(query_data, page.get_data(), dist_func_param_);
         }
 
@@ -1527,8 +1573,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 // unsigned int *data = (unsigned int *) get_linklist(currObj, level);
                 // int size = getListCount(data);
-                auto [page_id, offset] = get_higher_level_offset(currObj, level);
-                PointPageHigherLevel page(page_cache->get_page(page_id), offset);
+                auto [page_id, offset] = get_higher_level_offset(currObj, level, req_metrics);
+                PointPageHigherLevel page(page_cache->get_page(page_id, req_metrics), offset);
                 int size = page.get_neighbor_count();
 
                 metric_hops++;
@@ -1542,7 +1588,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         throw std::runtime_error("cand error");
 
                     auto [page_id, offset] = get_level0_offset(cand);
-                    PointPageLevel0 cand_page(page_cache->get_page(page_id), offset, this);
+                    PointPageLevel0 cand_page(page_cache->get_page(page_id, req_metrics), offset, this);
                     // dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
 
@@ -1559,10 +1605,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
             top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), req_metrics, isIdAllowed);
         } else {
             top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), req_metrics, isIdAllowed);
         }
 
         while (top_candidates.size() > k) {
@@ -1571,10 +1617,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         while (top_candidates.size() > 0) {
             std::pair<dist_t, tableint> rez = top_candidates.top();
             auto [page_id, offset] = get_level0_offset(rez.second);
-            PointPageLevel0 page(page_cache->get_page(page_id), offset, this);
+            PointPageLevel0 page(page_cache->get_page(page_id, req_metrics), offset, this);
             // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             result.push(std::pair<dist_t, labeltype>(rez.first, page.get_label()));
             top_candidates.pop();
+        }
+        req_metrics.off_cpu();
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            req_metrics_vec.push_back(req_metrics);
         }
         return result;
     }
