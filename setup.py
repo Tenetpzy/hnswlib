@@ -84,12 +84,15 @@ class BuildExt(build_ext):
     compiler_flag_native = '-march=native'
     c_opts = {
         'msvc': ['/EHsc', '/openmp', '/O2'],
-        'unix': ['-O3', compiler_flag_native],  # , '-w'
+        'unix': ['-O3', compiler_flag_native],
     }
     link_opts = {
         'unix': [],
         'msvc': [],
     }
+
+    # 始终添加调试支持：调试符号 + 保留帧指针（不影响优化级别）
+    c_opts['unix'].extend(['-g', '-fno-omit-frame-pointer'])
 
     if os.environ.get("HNSWLIB_NO_NATIVE"):
         c_opts['unix'].remove(compiler_flag_native)

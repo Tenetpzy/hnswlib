@@ -16,6 +16,7 @@ int main() {
     int ef_construction = 200;  // Controls index search speed/build speed tradeoff
     int cache_page_num = 48;
     int search_beam_width = 2;
+    int thread_num = 4;
 
     // Initing index
     hnswlib::L2Space space(dim);
@@ -56,7 +57,7 @@ int main() {
     delete alg_hnsw;
 
     // Deserialize index and check recall
-    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 16 * 1024, 4);
+    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 4096, thread_num);
     float correct = 0;
     auto executors = alg_hnsw->executors();
     std::vector<RescheduleLazy<std::priority_queue<std::pair<float, unsigned long>>>> tasks;
@@ -72,14 +73,22 @@ int main() {
     }
 
     int max_concurrency = cache_page_num / search_beam_width;
-    auto results = async_simple::coro::syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
+    auto results = syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
+    // auto results = syncAwait(collectAllPara(std::move(tasks)));
     for (int i = 0; i < max_elements; i++) {
         hnswlib::labeltype label = results[i].value().top().second;
         if (label == i) correct++;
     }
 
-    auto latencies = alg_hnsw->get_latency_ms();
-    double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    auto latencies = alg_hnsw->get_detailed_latency();
+    std::vector<double> cpu_latencys, io_latencys;
+    for (const auto &latency : latencies) {
+        cpu_latencys.push_back(latency.cpu_ms);
+        io_latencys.push_back(latency.io_ms);
+    }
+    double avg_cpu_latency = std::accumulate(cpu_latencys.begin(), cpu_latencys.end(), 0.0) / cpu_latencys.size();
+    double avg_io_latency = std::accumulate(io_latencys.begin(), io_latencys.end(), 0.0) / io_latencys.size();
+    double avg_latency = avg_cpu_latency + avg_io_latency;
     double qps = alg_hnsw->get_qps(avg_latency);
     double avg_depth_mean = alg_hnsw->page_cache->get_avg_depth_mean();
     double avg_depth_std = alg_hnsw->page_cache->get_avg_depth_std();
@@ -95,6 +104,10 @@ int main() {
         << alg_hnsw->get_memory_transfer_kb() << "\n"
         << "Average latency (ms): "
         << avg_latency << "\n"
+        << "  - CPU latency (ms): "
+        << avg_cpu_latency << "\n"
+        << "  - IO latency (ms): "
+        << avg_io_latency << "\n"
         << "QPS: "
         << qps << "\n"
         << "Avg channel depth: "

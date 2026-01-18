@@ -269,11 +269,12 @@ void HnswPageCache::unpin(PageEntry *entry) {
             TAILQ_INSERT_HEAD(&buffer_list, entry, entry);
             entry->list_head = &buffer_list;
         }
-
-        for (auto h: evict_waiters) {
+        
+        if (!evict_waiters.empty()) {
+            auto h = evict_waiters.front();
+            evict_waiters.pop_front();
             h.resume();
         }
-        evict_waiters.clear();
     }
 }
 

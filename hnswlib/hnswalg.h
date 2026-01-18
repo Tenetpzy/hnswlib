@@ -519,7 +519,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ReqMetrics &req_metrics,
         BaseFilterFunctor* isIdAllowed = nullptr,
         BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+        req_metrics.off_cpu();
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        req_metrics.on_cpu();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
@@ -555,6 +557,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
+        std::vector<int> adj_list_copy(maxM0_);
+
         bool flag_stop_search = false;
         while (!candidate_set.empty() && !flag_stop_search) {
             auto layer_count = candidate_set.size();
@@ -576,37 +580,43 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
                 candidate_set.pop();
 
-                tableint current_node_id = current_node_pair.second;
-                auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
-                auto cur_node_page_handler = co_await page_cache->get_page(cur_page_id, req_metrics);
-                PointPageLevel0 current_node_page(cur_node_page_handler, cur_off, this);
+                size_t size;
+                {
+                    tableint current_node_id = current_node_pair.second;
+                    auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
+                    auto cur_node_page_handler = co_await page_cache->get_page(cur_page_id, req_metrics);
+                    PointPageLevel0 current_node_page(cur_node_page_handler, cur_off, this);
 
-                // int *data = (int *) get_linklist0(current_node_id);
-                int* data = (int *) current_node_page.get_neighbor_list();
-                // size_t size = getListCount((linklistsizeint*)data);
-                size_t size = current_node_page.get_neighbor_count();
-    //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+                    // int *data = (int *) get_linklist0(current_node_id);
+                    int* data = (int *) current_node_page.get_neighbor_list();
+                    // size_t size = getListCount((linklistsizeint*)data);
+                    size = current_node_page.get_neighbor_count();
+        //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+        
+                    // copy the adjacency list to avoid multiple page fetches
+                    memcpy(adj_list_copy.data(), data, size * sizeof(int));
+                }
                 if (collect_metrics) {
                     metric_hops++;
                     metric_distance_computations+=size;
                 }
 
     #ifdef USE_SSE
-                // _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-                _mm_prefetch((char *) (visited_array + *data), _MM_HINT_T0);
-                // _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-                _mm_prefetch((char *) (visited_array + *data + 64), _MM_HINT_T0);
-                // _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-                // _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
-                _mm_prefetch((char *) (data + 1), _MM_HINT_T0);
+                // // _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+                // _mm_prefetch((char *) (visited_array + *data), _MM_HINT_T0);
+                // // _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                // _mm_prefetch((char *) (visited_array + *data + 64), _MM_HINT_T0);
+                // // _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                // // _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+                // _mm_prefetch((char *) (data + 1), _MM_HINT_T0);
     #endif
 
                 // for (size_t j = 1; j <= size; j++) {
                 for (size_t j = 0; j < size; j++) {
-                    int candidate_id = *(data + j);
+                    int candidate_id = adj_list_copy[j];
     //                    if (candidate_id == 0) continue;
     #ifdef USE_SSE
-                    _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                    _mm_prefetch((char *) (visited_array + adj_list_copy[j + 1]), _MM_HINT_T0);
                     // _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
                     //                 _MM_HINT_T0);  ////////////
     #endif
@@ -688,7 +698,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        req_metrics.off_cpu();
         visited_list_pool_->releaseVisitedList(vl);
+        req_metrics.on_cpu();
         co_return top_candidates;
     }
 
