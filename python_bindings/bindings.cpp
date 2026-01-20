@@ -674,7 +674,8 @@ class Index {
                     tasks.push_back(appr_alg->searchKnn((void*)items.data(row), k, p_idFilter).via(executor[row % executor.size()]));
                 }
                 int max_concurrency = appr_alg->page_cache->get_page_num() / beam_width;
-                if (max_concurrency < 1) max_concurrency = 1;
+                max_concurrency = 2 * executor.size();
+                std::cout << "max_concurrency = " << max_concurrency << std::endl;
                 auto results = syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
                 for (size_t row = 0; row < rows; ++row) {
                     auto result = std::move(results[row].value());
@@ -797,7 +798,8 @@ class Index {
         return appr_alg->get_detailed_latency();
     }
 
-    double get_qps(double avg_latency_ms) const {
+    double get_qps(double avg_latency_ms, size_t thread_num = 1) const {
+        // thread num unused here, kept for API compatibility
         return appr_alg->get_qps(avg_latency_ms);
     }
 
@@ -1059,7 +1061,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_memory_transfer_kb", &Index<float>::get_memory_transfer_kb)
         .def("get_latency_ms", &Index<float>::get_latency_ms)
         .def("get_detailed_latency", &Index<float>::get_detailed_latency)
-        .def("get_qps", &Index<float>::get_qps, py::arg("avg_latency_ms"))
+        .def("get_qps", &Index<float>::get_qps, py::arg("avg_latency_ms"), py::arg("thread_num") = 1)
         .def("get_avg_depth_mean", &Index<float>::get_avg_depth_mean)
         .def("get_avg_depth_std", &Index<float>::get_avg_depth_std)
         .def("reset_metrics_counter", &Index<float>::reset_metrics_counter)

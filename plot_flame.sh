@@ -14,4 +14,4 @@ if [[ "$OUT_FILE" != *.svg ]]; then
 fi
 
 # perf script -> 折叠栈 -> 绘制 svg
-sudo perf script -i $PERF_DATA | "$FG_DIR/stackcollapse-perf.pl" | "$FG_DIR/flamegraph.pl" > "$OUT_FILE"
+perf script -i $PERF_DATA | "$FG_DIR/stackcollapse-perf.pl" | "$FG_DIR/flamegraph.pl" > "$OUT_FILE"

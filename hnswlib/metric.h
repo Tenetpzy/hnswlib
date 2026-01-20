@@ -5,8 +5,8 @@
 #include <chrono>
 #include <cstdint>
 
-constexpr inline uint64_t io_latency_us = 400; // assume each io op takes 400us
-constexpr inline uint64_t beam_width = 2;
+constexpr inline uint64_t io_latency_us = 150; // assume each io op takes 150us
+constexpr inline uint64_t beam_width = 4;
 constexpr inline uint64_t ssd_channel_num = 8;
 
 struct DetailLatency {
@@ -14,9 +14,13 @@ struct DetailLatency {
     double io_ms;
 };
 
+static inline std::atomic_uint32_t global_req_id;
+
 class ReqMetrics {
 public:
-    ReqMetrics(): cpu_duration(0), io_nums(0) {}
+    ReqMetrics(): cpu_duration(0), io_nums(0) {
+        req_id = ++global_req_id;
+    }
     ~ReqMetrics() = default;
 
     void on_cpu() __attribute__((always_inline)) {
@@ -52,7 +56,12 @@ public:
         return DetailLatency{cpu_ms, io_ms};
     }
 
+    uint32_t id() const {
+        return req_id;
+    }
+
 private:
+    uint32_t req_id;
     std::chrono::steady_clock::time_point start_time;
     std::chrono::nanoseconds cpu_duration;
     uint64_t io_nums;

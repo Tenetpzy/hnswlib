@@ -397,7 +397,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     double get_qps(double avg_latency_ms) const {
-        uint64_t parallel_num = page_cache->get_page_num() / beam_width;  // batch coroutine(query) num
+        uint64_t parallel_num = 4 * executors_ptr->size();
         if (avg_latency_ms == 0.0) 
             return 0.0;
         return parallel_num * 1000.0 / avg_latency_ms;

@@ -20,7 +20,7 @@ int main() {
 
     // Initing index
     hnswlib::L2Space space(dim);
-    hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, M, ef_construction);
+    hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, M, ef_construction, 16384);
 
     // Generate random data
     std::mt19937 rng;
@@ -57,7 +57,7 @@ int main() {
     delete alg_hnsw;
 
     // Deserialize index and check recall
-    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 4096, thread_num);
+    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 16384, thread_num);
     float correct = 0;
     auto executors = alg_hnsw->executors();
     std::vector<RescheduleLazy<std::priority_queue<std::pair<float, unsigned long>>>> tasks;
@@ -73,6 +73,7 @@ int main() {
     }
 
     int max_concurrency = cache_page_num / search_beam_width;
+    // int max_concurrency = cache_page_num;
     auto results = syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
     // auto results = syncAwait(collectAllPara(std::move(tasks)));
     for (int i = 0; i < max_elements; i++) {

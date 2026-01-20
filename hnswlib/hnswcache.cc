@@ -3,6 +3,8 @@
 #include "metric.h"
 #include <cassert>
 #include <fcntl.h>
+#include <format>
+#include <iostream>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -104,7 +106,9 @@ Lazy<PageHandler> HnswPageCache::get_page(page_id_t page_id, ReqMetrics &req_met
         ++entry->access_count;
         add_page_ref(entry);
         req_metrics.off_cpu();
+        // std::cout << std::format("Req {}: wait for page {} loading\n", req_metrics.id(), page_id);
         co_await PageLoadingAwaiter(entry);
+        // std::cout << std::format("Req {}: resume from waiting page {} loading\n", req_metrics.id(), page_id);
         req_metrics.on_cpu();
         co_return PageHandler(dispatcher, entry);
     }
@@ -299,7 +303,9 @@ private:
 Lazy<PageEntry*> HnswPageCache::evict_one_for_use(ReqMetrics &req_metrics) {
     while (TAILQ_EMPTY(&history_list) && TAILQ_EMPTY(&buffer_list)) {
         req_metrics.off_cpu();
+        // std::cout << std::format("Req {}: wait for evicting a page\n", req_metrics.id());
         co_await EvictAwaiter(this);
+        // std::cout << std::format("Req {}: resume from waiting evicting a page\n", req_metrics.id());
         req_metrics.on_cpu();
     }
     
@@ -328,13 +334,14 @@ Lazy<void> HnswPageCache::load_from_disk(PageEntry *entry, ReqMetrics &req_metri
     req_metrics.off_cpu();
     auto channel_id = entry->page_id % ssd_channel_num;  // same as simulator
     (*channel_metrics)[channel_id].add_req();
+    // std::cout << std::format("Req {}: loading page {}\n", req_metrics.id(), entry->page_id);
     auto bytes_read = co_await HnswExecutor::UringContext::current_executor()
         .async_read(fd, entry->data, static_cast<unsigned>(page_size), offset, (*channel_metrics)[channel_id]);
-    req_metrics.on_cpu();
-
+    // std::cout << std::format("Req {}: finished loading page {}\n", req_metrics.id(), entry->page_id);
     req_metrics.add_io();
     ++io_op_num;
     memory_transfer_bytes += static_cast<size_t>(bytes_read);
+    req_metrics.on_cpu();
     if (bytes_read < 0) {
         throw std::runtime_error("failed to read page from disk");
     }
