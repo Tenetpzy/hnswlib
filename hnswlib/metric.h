@@ -5,8 +5,8 @@
 #include <chrono>
 #include <cstdint>
 
-constexpr inline uint64_t io_latency_us = 400; // assume each io op takes 400us
-constexpr inline uint64_t beam_width = 2;
+constexpr inline uint64_t io_latency_us = 150; // assume each io op takes 150us
+constexpr inline uint64_t beam_width = 1;
 constexpr inline uint64_t ssd_channel_num = 8;
 
 struct DetailLatency {

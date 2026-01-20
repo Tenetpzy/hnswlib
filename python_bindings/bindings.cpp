@@ -4,7 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "hnswlib.h"
-#include "hnswlib/metric.h"
+#include "metric.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
@@ -749,7 +749,7 @@ class Index {
     }
 
     double get_qps(double avg_latency_ms, size_t thread_num = 1) const {
-        return appr_alg->get_qps(avg_latency_ms);
+        return appr_alg->get_qps(avg_latency_ms, thread_num);
     }
 
     double get_avg_depth_mean() const {
