@@ -139,12 +139,17 @@ public:
         return sum / channel_metrics.size();
     }
 
+    // 使用req_count的std
     double get_avg_depth_std() const {
         if (channel_metrics.empty()) return 0.0;
-        double mean = get_avg_depth_mean();
+        double sum = 0.0;
+        for (const auto &metrics : channel_metrics) {
+            sum += metrics.get_req_count();
+        }
+        double mean = sum / channel_metrics.size();
         double variance_sum = 0.0;
         for (const auto &metrics : channel_metrics) {
-            double diff = metrics.get_avg_depth() - mean;
+            double diff = static_cast<double>(metrics.get_req_count()) - mean;
             variance_sum += diff * diff;
         }
         return std::sqrt(variance_sum / channel_metrics.size());
