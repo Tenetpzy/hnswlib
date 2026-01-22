@@ -87,6 +87,10 @@ public:
         return static_cast<double>(depth_sum) / req_count;
     }
 
+    uint64_t get_req_count() const {
+        return req_count.load();
+    }
+
     void reset() {
         depth = 0;
         depth_sum = 0;
