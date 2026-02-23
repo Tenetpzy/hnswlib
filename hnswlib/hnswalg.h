@@ -1681,42 +1681,46 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        std::queue<int> bfs_queue;
         std::vector<bool> visited(cur_element_count, false);
+        std::vector<std::pair<int, int>> unvisited_neighbors;  // (degree, node_id)
         id_to_store_order.resize(cur_element_count);
         store_order_to_id.clear();
 
-        std::queue<int> bfs_queue;
-        std::vector<std::pair<int, int>> degree_id_vec;  // (degree, id)
         bfs_queue.push(cur_id);
         visited[cur_id] = true;
+        id_to_store_order[cur_id] = store_order_to_id.size();
+        store_order_to_id.emplace_back(cur_id);
 
         while (!bfs_queue.empty()) {
-            int count = bfs_queue.size();
-            degree_id_vec.clear();
-            for (int i = 0; i < count; ++i) {
-                int node_id = bfs_queue.front();
-                bfs_queue.pop();
-                unsigned int *data = get_linklist0(node_id);
-                int degree = getListCount(data);
-                degree_id_vec.emplace_back(degree, node_id);
+            int parent = bfs_queue.front();
+            bfs_queue.pop();
+
+            // 获取所有未访问的邻接节点
+            unvisited_neighbors.clear();
+            unsigned int *data = get_linklist0(parent);
+            int degree = getListCount(data);
+            tableint *datal = (tableint *) (data + 1);
+            for (int i = 0; i < degree; i++) {
+                tableint neighbor_id = datal[i];
+                if (!visited[neighbor_id]) {
+                    unsigned int *neighbor_data = get_linklist0(neighbor_id);
+                    int neighbor_degree = getListCount(neighbor_data);
+                    unvisited_neighbors.emplace_back(neighbor_degree, neighbor_id);
+                }
             }
 
-            // sort by degree ascending
-            std::sort(degree_id_vec.begin(), degree_id_vec.end());
-            for (auto &[_, node_id] : degree_id_vec) {
+            // === 关键步骤 ===
+            // 对这些邻居按度数(Degree)从低到高排序
+            // 注意：只排当前这一批邻居，不影响队列里已有的其他节点
+            std::sort(unvisited_neighbors.begin(), unvisited_neighbors.end());
+
+            // 按排好的顺序入队并编号
+            for (auto &[_, node_id] : unvisited_neighbors) {
+                visited[node_id] = true;
                 id_to_store_order[node_id] = store_order_to_id.size();
                 store_order_to_id.emplace_back(node_id);
-
-                unsigned int *data = get_linklist0(node_id);
-                int degree = getListCount(data);
-                tableint *datal = (tableint *) (data + 1);
-                for (int i = 0; i < degree; i++) {
-                    tableint neighbor_id = datal[i];
-                    if (!visited[neighbor_id]) {
-                        visited[neighbor_id] = true;
-                        bfs_queue.push(neighbor_id);
-                    }
-                }
+                bfs_queue.push(node_id);
             }
         }
 
