@@ -233,12 +233,12 @@ class Index {
     }
 
 
-    void loadIndex(const std::string &path_to_index, size_t max_elements, size_t cache_size, bool allow_replace_deleted, size_t thread_num = 1) {
+    void loadIndex(const std::string &path_to_index, size_t max_elements, size_t cache_size, bool allow_replace_deleted, size_t thread_num = 1, size_t csd_thread_num = 0) {
       if (appr_alg) {
         //   std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
           delete appr_alg;
       }
-      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, cache_size, thread_num, false, max_elements, allow_replace_deleted);
+      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, cache_size, thread_num, csd_thread_num, false, max_elements, allow_replace_deleted);
       cur_l = appr_alg->cur_element_count;
       index_inited = true;
     }
@@ -1050,7 +1050,8 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("max_elements") = 0,
             py::arg("cache_size") = 0,
             py::arg("allow_replace_deleted") = false,
-            py::arg("thread_num") = 1)
+            py::arg("thread_num") = 1,
+            py::arg("csd_thread_num") = 0)
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))

@@ -57,7 +57,7 @@ int main() {
     delete alg_hnsw;
 
     // Deserialize index and check recall
-    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 16384, thread_num);
+    alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path, cache_page_num * 16384, thread_num, 2);
     float correct = 0;
     auto executors = alg_hnsw->executors();
     std::vector<RescheduleLazy<std::priority_queue<std::pair<float, unsigned long>>>> tasks;

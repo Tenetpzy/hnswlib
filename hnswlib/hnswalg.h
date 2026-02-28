@@ -151,8 +151,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
-    std::unique_ptr<std::vector<HnswExecutor::UringExecutor*>> executors_ptr;
-    std::unique_ptr<HnswPageCacheDispatcher> page_cache;
+    // 向后兼容别名（裸指针，不拥有所有权）
+    std::vector<HnswExecutor::UringExecutor*>* executors_ptr{nullptr};
+    HnswPageCacheDispatcher* page_cache{nullptr};
+
+    // 主机侧执行环境
+    std::unique_ptr<std::vector<HnswExecutor::UringExecutor*>> host_executors;
+    std::unique_ptr<HnswPageCacheDispatcher> host_page_cache;
+
+    // CSD侧执行环境（可选，为nullptr时表示未启用CSD）
+    std::unique_ptr<std::vector<HnswExecutor::UringExecutor*>> csd_executors;
+    std::unique_ptr<HnswPageCacheDispatcher> csd_page_cache;
+
+    // 配置参数
+    size_t host_thread_num_{0};
+    size_t csd_thread_num_{0};
+
+    // 每个主机executor一个query_counter，用于负载均衡（无需原子，每个executor单线程访问）
+    mutable std::vector<size_t> host_query_counters;
+
     size_t page_size_{0};  // page size for on-demand loading
     size_t level0_elements_per_page_{0};  // number of elements per page in level 0
     page_id_t level0_first_page_id_{0};  // page id of the first element in level 0
@@ -168,11 +185,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const std::string &location,
         size_t cache_size = 0,
         size_t thread_num = 1,
+        size_t csd_thread_num = 0,
         bool nmslib = false,
         size_t max_elements = 0,
         bool allow_replace_deleted = false)
         : allow_replace_deleted_(allow_replace_deleted) {
-        loadIndex(location, s, max_elements, cache_size, thread_num);
+        loadIndex(location, s, max_elements, cache_size, thread_num, csd_thread_num);
     }
 
 
@@ -517,6 +535,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const void *data_point,
         size_t ef,
         ReqMetrics &req_metrics,
+        HnswPageCacheDispatcher* page_cache_to_use,
         BaseFilterFunctor* isIdAllowed = nullptr,
         BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
         req_metrics.off_cpu();
@@ -531,7 +550,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t lowerBound;
         {
             auto [ep_page_id, ep_offset] = get_level0_offset(ep_id);
-            auto ep_page_handler = co_await page_cache->get_page(ep_page_id, req_metrics);
+            auto ep_page_handler = co_await page_cache_to_use->get_page(ep_page_id, req_metrics);
             PointPageLevel0 ep_page(ep_page_handler, ep_offset, this); 
             if (bare_bone_search || 
                 // (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
@@ -584,7 +603,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 {
                     tableint current_node_id = current_node_pair.second;
                     auto [cur_page_id, cur_off] = get_level0_offset(current_node_id);
-                    auto cur_node_page_handler = co_await page_cache->get_page(cur_page_id, req_metrics);
+                    auto cur_node_page_handler = co_await page_cache_to_use->get_page(cur_page_id, req_metrics);
                     PointPageLevel0 current_node_page(cur_node_page_handler, cur_off, this);
 
                     // int *data = (int *) get_linklist0(current_node_id);
@@ -637,7 +656,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     //     }
                     // }
 
-                    auto cand_page_handler = co_await page_cache->get_page(cand_page_id, req_metrics);
+                    auto cand_page_handler = co_await page_cache_to_use->get_page(cand_page_id, req_metrics);
                     PointPageLevel0 cand_page(cand_page_handler, cand_off, this);
 
                     // char *currObj1 = (getDataByInternalId(candidate_id));
@@ -682,7 +701,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         top_candidates.pop();
                         if (!bare_bone_search && stop_condition) {
                             auto [page_id, off] = get_level0_offset(id);
-                            auto page_handler = co_await page_cache->get_page(page_id, req_metrics);
+                            auto page_handler = co_await page_cache_to_use->get_page(page_id, req_metrics);
                             PointPageLevel0 page(page_handler, off, this);
                             // stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
                             stop_condition->remove_point_from_result(page.get_label(), page.get_data(), dist);
@@ -1101,7 +1120,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0, size_t cache_size_i = 0, size_t thread_num = 4) {
+    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0, size_t cache_size_i = 0, size_t thread_num = 4, size_t csd_thread_num = 0) {
         std::ifstream input(location, std::ios::binary);
 
         if (!input.is_open())
@@ -1210,16 +1229,42 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         input.close();
 
-        thread_req_metrics = std::vector<std::vector<ReqMetrics>>(thread_num, std::vector<ReqMetrics>());
+        // 存储配置
+        this->host_thread_num_ = thread_num;
+        this->csd_thread_num_ = csd_thread_num;
 
-        // Initialize executors based on thread_num
-        executors_ptr = std::make_unique<std::vector<HnswExecutor::UringExecutor*>>();
+        // thread_req_metrics大小基于最大cpu_id+1
+        size_t max_cpu_id = thread_num + csd_thread_num - 1;
+        if (max_cpu_id < thread_num - 1) max_cpu_id = thread_num - 1;  // 防止csd_thread_num=0时下溢
+        thread_req_metrics = std::vector<std::vector<ReqMetrics>>(max_cpu_id + 1, std::vector<ReqMetrics>());
+
+        // 每个主机executor一个query_counter
+        host_query_counters = std::vector<size_t>(thread_num, 0);
+
+        // 主机侧：CPU 0 ~ thread_num-1
+        host_executors = std::make_unique<std::vector<HnswExecutor::UringExecutor*>>();
         for (size_t i = 0; i < thread_num; i++) {
-            executors_ptr->emplace_back(new HnswExecutor::UringExecutor(static_cast<int>(i)));
-            (*executors_ptr)[i]->start();
+            host_executors->emplace_back(new HnswExecutor::UringExecutor(static_cast<int>(i)));
+            (*host_executors)[i]->start();
         }
+        host_page_cache = std::unique_ptr<HnswPageCacheDispatcher>(
+            new HnswPageCacheDispatcher(*host_executors, location, page_size_, cache_size));
 
-        page_cache = std::unique_ptr<HnswPageCacheDispatcher>(new HnswPageCacheDispatcher(*executors_ptr, location, page_size_, cache_size));
+        // 向后兼容（裸指针指向host侧实例）
+        executors_ptr = host_executors.get();
+        page_cache = host_page_cache.get();
+
+        // CSD侧（如果启用）：CPU thread_num ~ thread_num+csd_thread_num-1
+        if (csd_thread_num > 0) {
+            csd_executors = std::make_unique<std::vector<HnswExecutor::UringExecutor*>>();
+            for (size_t i = 0; i < csd_thread_num; i++) {
+                int cpu_id = static_cast<int>(thread_num + i);  // 从主机侧最大CPU ID之后分配
+                csd_executors->emplace_back(new HnswExecutor::UringExecutor(cpu_id));
+                (*csd_executors)[i]->start();
+            }
+            csd_page_cache = std::unique_ptr<HnswPageCacheDispatcher>(
+                new HnswPageCacheDispatcher(*csd_executors, location, page_size_, cache_size));
+        }
 
         return;
     }
@@ -1764,7 +1809,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t curdist;
         {
             auto [page_id, offset] = get_level0_offset(enterpoint_node_);
-            auto page_handler = co_await page_cache->get_page(page_id, req_metrics);
+            auto page_handler = co_await host_page_cache->get_page(page_id, req_metrics);
             PointPageLevel0 page(page_handler, offset, this);
             curdist = fstdistfunc_(query_data, page.get_data(), dist_func_param_);
         }
@@ -1777,7 +1822,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 unsigned int *data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
                 // auto [page_id, offset] = co_await get_higher_level_offset(currObj, level);
-                // PointPageHigherLevel page(co_await page_cache->get_page(page_id), offset);
+                // PointPageHigherLevel page(co_await host_page_cache->get_page(page_id), offset);
                 // int size = page.get_neighbor_count();
 
                 metric_hops++;
@@ -1791,7 +1836,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         throw std::runtime_error("cand error");
 
                     auto [page_id, offset] = get_level0_offset(cand);
-                    auto page_handler = co_await page_cache->get_page(page_id, req_metrics);
+                    auto page_handler = co_await host_page_cache->get_page(page_id, req_metrics);
                     PointPageLevel0 cand_page(page_handler, offset, this);
                     dist_t d = fstdistfunc_(query_data, cand_page.get_data(), dist_func_param_);
 
@@ -1806,12 +1851,44 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
-        if (bare_bone_search) {
-            top_candidates = co_await searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), req_metrics, isIdAllowed);
+
+        // 获取当前请求所在的主机executor索引
+        // 每个searchKnn协程已绑定到一个主机executor，通过current_executor获取其id
+        int host_exec_id = HnswExecutor::UringContext::current_executor().id();
+
+        // 使用该主机executor对应的query_counter（无需原子操作，每个executor单线程访问）
+        size_t& counter = host_query_counters[host_exec_id];
+        size_t total_weight = host_thread_num_ + csd_thread_num_;
+        size_t selection = counter % total_weight;
+        counter++;
+
+        if (csd_thread_num_ > 0 && selection >= host_thread_num_) {
+            // 调度到CSD侧执行
+            size_t csd_idx = (selection - host_thread_num_) % csd_thread_num_;
+            auto* csd_exec = (*csd_executors)[csd_idx];
+
+            if (bare_bone_search) {
+                top_candidates = co_await searchBaseLayerST<true>(
+                        currObj, query_data, std::max(ef_, k), req_metrics,
+                        csd_page_cache.get(), isIdAllowed)
+                    .via(csd_exec);
+            } else {
+                top_candidates = co_await searchBaseLayerST<false>(
+                        currObj, query_data, std::max(ef_, k), req_metrics,
+                        csd_page_cache.get(), isIdAllowed)
+                    .via(csd_exec);
+            }
         } else {
-            top_candidates = co_await searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), req_metrics, isIdAllowed);
+            // 主机侧执行（使用host_page_cache）
+            if (bare_bone_search) {
+                top_candidates = co_await searchBaseLayerST<true>(
+                        currObj, query_data, std::max(ef_, k), req_metrics,
+                        host_page_cache.get(), isIdAllowed);
+            } else {
+                top_candidates = co_await searchBaseLayerST<false>(
+                        currObj, query_data, std::max(ef_, k), req_metrics,
+                        host_page_cache.get(), isIdAllowed);
+            }
         }
 
         while (top_candidates.size() > k) {
@@ -1820,7 +1897,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         while (top_candidates.size() > 0) {
             std::pair<dist_t, tableint> rez = top_candidates.top();
             auto [page_id, offset] = get_level0_offset(rez.second);
-            auto page_handler = co_await page_cache->get_page(page_id, req_metrics);
+            auto page_handler = co_await host_page_cache->get_page(page_id, req_metrics);
             PointPageLevel0 page(page_handler, offset, this);
             // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             result.push(std::pair<dist_t, labeltype>(rez.first, page.get_label()));
