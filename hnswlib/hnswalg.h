@@ -1858,37 +1858,22 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         // 使用该主机executor对应的query_counter（无需原子操作，每个executor单线程访问）
         size_t& counter = host_query_counters[host_exec_id];
-        size_t total_weight = host_thread_num_ + csd_thread_num_;
-        size_t selection = counter % total_weight;
+        size_t csd_idx = counter % csd_thread_num_;
         counter++;
 
-        if (csd_thread_num_ > 0 && selection >= host_thread_num_) {
-            // 调度到CSD侧执行
-            size_t csd_idx = (selection - host_thread_num_) % csd_thread_num_;
-            auto* csd_exec = (*csd_executors)[csd_idx];
+        // 直接调度到CSD侧执行，在所有csd_executors上均匀分布
+        auto* csd_exec = (*csd_executors)[csd_idx];
 
-            if (bare_bone_search) {
-                top_candidates = co_await searchBaseLayerST<true>(
-                        currObj, query_data, std::max(ef_, k), req_metrics,
-                        csd_page_cache.get(), isIdAllowed)
-                    .via(csd_exec);
-            } else {
-                top_candidates = co_await searchBaseLayerST<false>(
-                        currObj, query_data, std::max(ef_, k), req_metrics,
-                        csd_page_cache.get(), isIdAllowed)
-                    .via(csd_exec);
-            }
+        if (bare_bone_search) {
+            top_candidates = co_await searchBaseLayerST<true>(
+                    currObj, query_data, std::max(ef_, k), req_metrics,
+                    csd_page_cache.get(), isIdAllowed)
+                .via(csd_exec);
         } else {
-            // 主机侧执行（使用host_page_cache）
-            if (bare_bone_search) {
-                top_candidates = co_await searchBaseLayerST<true>(
-                        currObj, query_data, std::max(ef_, k), req_metrics,
-                        host_page_cache.get(), isIdAllowed);
-            } else {
-                top_candidates = co_await searchBaseLayerST<false>(
-                        currObj, query_data, std::max(ef_, k), req_metrics,
-                        host_page_cache.get(), isIdAllowed);
-            }
+            top_candidates = co_await searchBaseLayerST<false>(
+                    currObj, query_data, std::max(ef_, k), req_metrics,
+                    csd_page_cache.get(), isIdAllowed)
+                .via(csd_exec);
         }
 
         while (top_candidates.size() > k) {
