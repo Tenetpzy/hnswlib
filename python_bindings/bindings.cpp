@@ -674,7 +674,7 @@ class Index {
                     tasks.push_back(appr_alg->searchKnn((void*)items.data(row), k, p_idFilter).via(executor[row % executor.size()]));
                 }
                 int max_concurrency = appr_alg->page_cache->get_page_num() / beam_width;
-                max_concurrency = 2 * executor.size();
+                max_concurrency = 5 * executor.size();
                 std::cout << "max_concurrency = " << max_concurrency << std::endl;
                 auto results = syncAwait(collectAllWindowedPara(max_concurrency, false, std::move(tasks)));
                 for (size_t row = 0; row < rows; ++row) {
